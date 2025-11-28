@@ -221,7 +221,28 @@ proc isValidEvent(event: Event): bool =
   # Placeholder for actual event validation logic
   return event.id.len > 0 and event.pubkey.len > 0 and event.sig.len > 0
 
-proc saveEventToDB(event: Event): bool =
+proc deleteEventByIdAndPubkey(id: string, pubkey: string): bool =
+  try:
+    db.exec(sql"DELETE FROM event WHERE id = ? AND pubkey = ?", id, pubkey)
+    return true
+  except DbError:
+    return false
+
+proc deleteEventByKindAndPubkey(kind: int, pubkey: string, created_at: int): bool =
+  try:
+    db.exec(sql"DELETE FROM event WHERE kind = ? AND pubkey = ? AND created_at <= ?", kind, pubkey, created_at)
+    return true
+  except DbError:
+    return false
+
+proc deleteEventByKindAndPubkeyAndDtag(kind: int, pubkey: string, dtag: string, created_at: int): bool =
+  try:
+    db.exec(sql"DELETE FROM event WHERE kind = ? AND pubkey = ? AND tags @> ?::jsonb AND created_at <= ?", kind, pubkey, ["d", dtag].toJson(), created_at)
+    return true
+  except DbError:
+    return false
+
+proc saveEvent(event: Event): bool =
   try:
     db.exec(sql"""
       INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
@@ -301,10 +322,34 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
         result: false, message: "invalid: signature verification failed")))
     return
 
-  if not saveEventToDB(msg.event):
-    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
-        result: false, message: "error: failed to save event")))
+  if msg.event.kind == 5:
+    for tag in msg.event.tags:
+      if tag.len > 1 and tag[0] == "e":
+        if not deleteEventByIdAndPubkey(tag[1], msg.event.pubkey):
+          await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "error: failed to delete event")))
+          return
+    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "invalid: kind out of range")))
     return
+  elif msg.event.kind >= 20000 and msg.event.kind < 30000:
+    # Ephemeral events: broadcast only, don't save to database
+    discard
+  else:
+    if msg.event.kind == 0 or msg.event.kind == 3 or (msg.event.kind >= 10000 and msg.event.kind < 20000):
+      if not deleteEventByKindAndPubkey(msg.event.kind, msg.event.pubkey, msg.event.created_at):
+        await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "error: failed to delete event")))
+        return
+    elif msg.event.kind >= 30000 and msg.event.kind < 40000:
+      for tag in msg.event.tags:
+        if tag.len > 1 and tag[0] == "d" and tag[1].len > 0:
+          if not deleteEventByKindAndPubkeyAndDtag(msg.event.kind, msg.event.pubkey, tag[1], msg.event.created_at):
+            await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "error: failed to delete event")))
+            return
+      discard
+
+    if not saveEvent(msg.event):
+      await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+          result: false, message: "error: failed to save event")))
+      return
 
   await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
       result: true, message: "")))
