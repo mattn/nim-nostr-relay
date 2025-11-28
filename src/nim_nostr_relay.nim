@@ -5,6 +5,7 @@ import json, jsony, options, sequtils
 import secp256k1
 import nimcrypto/[sha2, hash]
 import db_connector/db_postgres
+from std/times import getTime, toUnix
 from std/os import parentDir, `/`, splitFile, fileExists, getEnv
 
 when defined(posix):
@@ -228,16 +229,20 @@ proc deleteEventByIdAndPubkey(id: string, pubkey: string): bool =
   except DbError:
     return false
 
-proc deleteEventByKindAndPubkey(kind: int, pubkey: string, created_at: int): bool =
+proc deleteEventByKindAndPubkey(kind: int, pubkey: string,
+    created_at: int): bool =
   try:
-    db.exec(sql"DELETE FROM event WHERE kind = ? AND pubkey = ? AND created_at <= ?", kind, pubkey, created_at)
+    db.exec(sql"DELETE FROM event WHERE kind = ? AND pubkey = ? AND created_at <= ?",
+        kind, pubkey, created_at)
     return true
   except DbError:
     return false
 
-proc deleteEventByKindAndPubkeyAndDtag(kind: int, pubkey: string, dtag: string, created_at: int): bool =
+proc deleteEventByKindAndPubkeyAndDtag(kind: int, pubkey: string, dtag: string,
+    created_at: int): bool =
   try:
-    db.exec(sql"DELETE FROM event WHERE kind = ? AND pubkey = ? AND tags @> ?::jsonb AND created_at <= ?", kind, pubkey, ["d", dtag].toJson(), created_at)
+    db.exec(sql"DELETE FROM event WHERE kind = ? AND pubkey = ? AND tags @> ?::jsonb AND created_at <= ?",
+        kind, pubkey, ["d", dtag].toJson(), created_at)
     return true
   except DbError:
     return false
@@ -326,23 +331,31 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
     for tag in msg.event.tags:
       if tag.len > 1 and tag[0] == "e":
         if not deleteEventByIdAndPubkey(tag[1], msg.event.pubkey):
-          await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "error: failed to delete event")))
+          await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+              result: false, message: "error: failed to delete event")))
           return
-    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "invalid: kind out of range")))
+    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+        result: false, message: "invalid: kind out of range")))
     return
   elif msg.event.kind >= 20000 and msg.event.kind < 30000:
     # Ephemeral events: broadcast only, don't save to database
     discard
   else:
-    if msg.event.kind == 0 or msg.event.kind == 3 or (msg.event.kind >= 10000 and msg.event.kind < 20000):
-      if not deleteEventByKindAndPubkey(msg.event.kind, msg.event.pubkey, msg.event.created_at):
-        await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "error: failed to delete event")))
+    if msg.event.kind == 0 or msg.event.kind == 3 or (msg.event.kind >=
+        10000 and msg.event.kind < 20000):
+      if not deleteEventByKindAndPubkey(msg.event.kind, msg.event.pubkey,
+          msg.event.created_at):
+        await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+            result: false, message: "error: failed to delete event")))
         return
     elif msg.event.kind >= 30000 and msg.event.kind < 40000:
       for tag in msg.event.tags:
         if tag.len > 1 and tag[0] == "d" and tag[1].len > 0:
-          if not deleteEventByKindAndPubkeyAndDtag(msg.event.kind, msg.event.pubkey, tag[1], msg.event.created_at):
-            await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "error: failed to delete event")))
+          if not deleteEventByKindAndPubkeyAndDtag(msg.event.kind,
+              msg.event.pubkey, tag[1], msg.event.created_at):
+            await ws.send(toResponseJson(MsgResponse(kind: kOK,
+                id: msg.event.id, result: false,
+                message: "error: failed to delete event")))
             return
       discard
 
@@ -364,19 +377,31 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
 proc doREQ(ws: WebSocket, msg: MsgRequest) {.async.} =
   subscriptions.add Subscription(ws: ws, id: msg.subscriptionId,
       filters: msg.filters)
+  let now = getTime().toUnix()
   for filter in msg.filters:
     try:
       let (query, params) = buildQueryFromFilter(filter)
       for row in db.rows(sql(query), params):
+        let tags = fromJson(row[4], seq[seq[string]])
+
+        var expired = false
+        for tag in tags:
+          if tag.len > 0 and tag[0] == "expiration" and parseInt(tag[1]) <=
+              getTime().toUnix():
+            expired = true
+            break
+        if expired:
+          continue
         let event = Event(
           id: row[0],
           pubkey: row[1],
           created_at: parseInt(row[2]),
           kind: parseInt(row[3]),
-          tags: fromJson(row[4], seq[seq[string]]),
+          tags: tags,
           content: row[5],
           sig: row[6]
         )
+
         let eventJson = toJson(%*["EVENT", msg.subscriptionId, event])
         await ws.send(eventJson)
     except:
