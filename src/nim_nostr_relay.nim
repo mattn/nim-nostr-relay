@@ -11,7 +11,7 @@ from std/mimetypes import getExt, getMimeType, newMimetypes
 type
   RequestKind = enum
     kEVENT = "EVENT"
-    kREQ   = "REQ"
+    kREQ = "REQ"
     kCLOSE = "CLOSE"
 
   ResponseKind = enum
@@ -70,9 +70,9 @@ type
 
 
 var
-  subscriptions{.threadvar.} : seq[Subscription]
-  mimedb{.threadvar.} : mimetypes.MimeDB
-  db{.threadvar.} : DbConn
+  subscriptions{.threadvar.}: seq[Subscription]
+  mimedb{.threadvar.}: mimetypes.MimeDB
+  db{.threadvar.}: DbConn
 
 
 const SCHEMA_SQLS = [
@@ -166,7 +166,8 @@ proc filterMatch(event: Event, filter: Filter): bool =
     for reqTag in filter.tags.get():
       var foundTag = false
       for eventTag in event.tags:
-        if eventTag.len > 1 and eventTag[0] == reqTag[0] and eventTag[1] == reqTag[1]:
+        if eventTag.len > 1 and eventTag[0] == reqTag[0] and eventTag[1] ==
+            reqTag[1]:
           foundTag = true
           break
       match = match and foundTag
@@ -185,28 +186,28 @@ proc verifyEvent(event: Event): bool =
       event.tags,
       event.content
     ])
-    
+
     # Calculate event ID
     let hash = sha256.digest(serialized)
     var calculatedId = ""
     for b in hash.data:
       calculatedId.add(b.toHex(2).toLowerAscii())
-    
+
     # Verify event ID matches
     if calculatedId != event.id:
       return false
-    
+
     # Parse Schnorr signature and x-only public key from hex
     let sigResult = SkSchnorrSignature.fromHex(event.sig)
     if sigResult.isErr:
       return false
     let sig = sigResult.get()
-    
+
     let pubkeyResult = SkXOnlyPublicKey.fromHex(event.pubkey)
     if pubkeyResult.isErr:
       return false
     let pubkey = pubkeyResult.get()
-    
+
     # Verify Schnorr signature
     return sig.verify(hash.data, pubkey)
   except:
@@ -222,7 +223,7 @@ proc saveEventToDB(event: Event): bool =
       INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
       VALUES (?, ?, ?, ?, ?::jsonb, ?, ?)
       ON CONFLICT (id) DO NOTHING
-    """, event.id, event.pubkey, event.created_at, event.kind, 
+    """, event.id, event.pubkey, event.created_at, event.kind,
         toJson(event.tags), event.content, event.sig)
     return true
   except DbError:
@@ -231,7 +232,7 @@ proc saveEventToDB(event: Event): bool =
 proc buildQueryFromFilter(filter: Filter): (string, seq[string]) =
   var whereClauses: seq[string] = @[]
   var params: seq[string] = @[]
-  
+
   if filter.ids.isSome:
     let ids = filter.ids.get()
     var idConditions: seq[string] = @[]
@@ -240,7 +241,7 @@ proc buildQueryFromFilter(filter: Filter): (string, seq[string]) =
       idConditions.add("id LIKE ? || '%'")
     if idConditions.len > 0:
       whereClauses.add("(" & idConditions.join(" OR ") & ")")
-  
+
   if filter.authors.isSome:
     let authors = filter.authors.get()
     var authorConditions: seq[string] = @[]
@@ -249,56 +250,60 @@ proc buildQueryFromFilter(filter: Filter): (string, seq[string]) =
       authorConditions.add("pubkey LIKE ? || '%'")
     if authorConditions.len > 0:
       whereClauses.add("(" & authorConditions.join(" OR ") & ")")
-  
+
   if filter.kinds.isSome:
     let kinds = filter.kinds.get()
     whereClauses.add("kind IN (" & kinds.mapIt($it).join(",") & ")")
-  
+
   if filter.since.isSome:
     whereClauses.add("created_at >= " & $filter.since.get())
-  
+
   if filter.until.isSome:
     whereClauses.add("created_at <= " & $filter.until.get())
-  
+
   if filter.e.isSome:
     let etags = filter.e.get()
     for etag in etags:
       params.add(etag)
       whereClauses.add("? = ANY(tagvalues)")
-  
+
   if filter.p.isSome:
     let ptags = filter.p.get()
     for ptag in ptags:
       params.add(ptag)
       whereClauses.add("? = ANY(tagvalues)")
-  
+
   var query = "SELECT id, pubkey, created_at, kind, tags, content, sig FROM event"
   if whereClauses.len > 0:
     query &= " WHERE " & whereClauses.join(" AND ")
-  
+
   query &= " ORDER BY created_at DESC"
-  
+
   if filter.limit.isSome:
     query &= " LIMIT " & $filter.limit.get()
   else:
     query &= " LIMIT 500"
-  
+
   return (query, params)
 
 proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
   if not isValidEvent(msg.event):
-    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "invalid: event is invalid")))
+    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+        result: false, message: "invalid: event is invalid")))
     return
-  
+
   if not verifyEvent(msg.event):
-    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "invalid: signature verification failed")))
+    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+        result: false, message: "invalid: signature verification failed")))
     return
-  
+
   if not saveEventToDB(msg.event):
-    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: false, message: "error: failed to save event")))
+    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+        result: false, message: "error: failed to save event")))
     return
-  
-  await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id, result: true, message: "")))
+
+  await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+      result: true, message: "")))
   for sub in subscriptions:
     for filter in sub.filters:
       if filterMatch(msg.event, filter):
@@ -308,7 +313,8 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
 
 
 proc doREQ(ws: WebSocket, msg: MsgRequest) {.async.} =
-  subscriptions.add Subscription(ws: ws, id: msg.subscriptionId, filters: msg.filters)
+  subscriptions.add Subscription(ws: ws, id: msg.subscriptionId,
+      filters: msg.filters)
   for filter in msg.filters:
     try:
       let (query, params) = buildQueryFromFilter(filter)
@@ -327,7 +333,8 @@ proc doREQ(ws: WebSocket, msg: MsgRequest) {.async.} =
     except:
       echo "Failed to query events from database: ", getCurrentExceptionMsg()
 
-  await ws.send(toResponseJson(MsgResponse(kind: kEOSE, eoseSubscriptionId: msg.subscriptionId)))
+  await ws.send(toResponseJson(MsgResponse(kind: kEOSE,
+      eoseSubscriptionId: msg.subscriptionId)))
 
 
 proc doCLOSE(ws: WebSocket, msg: MsgRequest) =
@@ -348,7 +355,8 @@ proc process(ws: WebSocket) {.async, gcsafe.} =
       doCLOSE(ws, msg)
 
   except JsonParsingError:
-    await ws.send(toResponseJson(MsgResponse(kind: kNOTICE, notice: "Unknown payload format")))
+    await ws.send(toResponseJson(MsgResponse(kind: kNOTICE,
+        notice: "Unknown payload format")))
 
 
 proc cb(req: Request) {.async, gcsafe.} =
@@ -372,7 +380,8 @@ proc cb(req: Request) {.async, gcsafe.} =
 
     filename = currentSourcePath().parentDir / "public" / filename
     if fileExists(filename):
-      await req.respond(Http200, readFile(filename), newHttpHeaders({"Content-Type": getMimeType(mimedb, splitFile(filename).ext)}))
+      await req.respond(Http200, readFile(filename), newHttpHeaders({
+          "Content-Type": getMimeType(mimedb, splitFile(filename).ext)}))
       return
     await req.respond(Http404, "Not Found\n")
 
