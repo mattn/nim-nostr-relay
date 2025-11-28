@@ -6,6 +6,10 @@ import secp256k1
 import nimcrypto/[sha2, hash]
 import db_connector/db_postgres
 from std/os import parentDir, `/`, splitFile, fileExists, getEnv
+
+when defined(posix):
+  from std/posix import onSignal, SIGINT, SIGTERM
+
 from std/mimetypes import getExt, getMimeType, newMimetypes
 
 type
@@ -408,4 +412,44 @@ except:
 
 mimedb = newMimetypes()
 var server = newAsyncHttpServer()
-waitFor server.serve(Port(9001), cb)
+
+# Signal handler for graceful shutdown
+var keepRunning = true
+
+when defined(posix):
+  proc handleSignal(signal: cint) {.noconv.} =
+    echo "\nReceived shutdown signal, stopping..."
+    keepRunning = false
+
+  onSignal(SIGINT):
+    handleSignal(SIGINT)
+
+  onSignal(SIGTERM):
+    handleSignal(SIGTERM)
+
+when defined(windows):
+  import std/widestrs
+
+  proc consoleCtrlHandler(dwCtrlType: int32): int32 {.stdcall.} =
+    if dwCtrlType == 0 or dwCtrlType == 2: # CTRL_C_EVENT or CTRL_CLOSE_EVENT
+      echo "\nReceived shutdown signal, stopping..."
+      keepRunning = false
+      return 1
+    return 0
+
+  proc SetConsoleCtrlHandler(handler: pointer, add: int32): int32
+    {.importc: "SetConsoleCtrlHandler", dynlib: "kernel32", stdcall.}
+
+  discard SetConsoleCtrlHandler(cast[pointer](consoleCtrlHandler), 1)
+
+echo "Starting server on port 9001..."
+
+# Start server in async manner
+asyncCheck server.serve(Port(9001), cb)
+
+# Main loop that can be interrupted
+while keepRunning:
+  poll(100)
+
+echo "Server stopped."
+db.close()
