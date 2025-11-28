@@ -1,0 +1,17 @@
+# Docker ignore patterns
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+nimcache/
+htmldocs/
+*.log
+.git/
+.gitignore
+README.md
+schema.sql
+setenv.sh
+nim-nostr-relay
+kustomize
