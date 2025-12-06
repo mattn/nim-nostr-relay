@@ -40,6 +40,7 @@ type
     kinds*: Option[seq[int]]
     `e`*: Option[seq[string]]
     `p`*: Option[seq[string]]
+    `t`*: Option[seq[string]]
     tags*: Option[seq[seq[string]]]
     since*: Option[int64]
     until*: Option[int64]
@@ -167,6 +168,14 @@ proc filterMatch(event: Event, filter: Filter): bool =
         foundP = true
         break
     match = match and foundP
+  if filter.t.isSome:
+    var foundT = false
+    for tag in event.tags:
+      if tag.len > 1 and tag[0] == "t" and tag[1] in filter.t.get():
+        foundT = true
+        break
+    match = match and foundT
+
   if filter.tags.isSome:
     for reqTag in filter.tags.get():
       var foundTag = false
