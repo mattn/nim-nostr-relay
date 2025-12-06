@@ -343,9 +343,6 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
           await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
               result: false, message: "error: failed to delete event")))
           return
-    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
-        result: false, message: "invalid: kind out of range")))
-    return
   elif msg.event.kind >= 20000 and msg.event.kind < 30000:
     # Ephemeral events: broadcast only, don't save to database
     discard
