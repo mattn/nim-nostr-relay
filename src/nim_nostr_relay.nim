@@ -5,6 +5,7 @@ import json, jsony, options, sequtils
 import secp256k1
 import nimcrypto/[sha2, hash]
 import db_connector/db_postgres
+import std/strformat
 from std/times import getTime, toUnix
 from std/os import parentDir, `/`, splitFile, fileExists, getEnv
 
@@ -256,6 +257,14 @@ proc deleteEventByKindAndPubkeyAndDtag(kind: int, pubkey: string, dtag: string,
   except DbError:
     return false
 
+proc deleteEventByIdAndKindAndPtag(id: string, kind: int, ptag: string): bool =
+  try:
+    db.exec(sql"DELETE FROM event WHERE id = ? AND kind = ? AND tags @> ?::jsonb",
+        id, kind, ["p", ptag].toJson())
+    return true
+  except DbError:
+    return false
+
 proc saveEvent(event: Event): bool =
   try:
     db.exec(sql"""
@@ -267,6 +276,20 @@ proc saveEvent(event: Event): bool =
     return true
   except DbError:
     return false
+
+proc getEventById(id: string): Option[Event] =
+  var row = db.getRow(sql("SELECT id, pubkey, created_at, kind, tags, content, sig FROM event WHERE id = ?"), [id])
+  if row[0] != "":
+    return option(Event(
+      id: row[0],
+      pubkey: row[1],
+      created_at: parseInt(row[2]),
+      kind: parseInt(row[3]),
+      tags: fromJson(row[4], seq[seq[string]]),
+      content: row[5],
+      sig: row[6]
+    ))
+  return none(Event)
 
 proc buildQueryFromFilter(filter: Filter): (string, seq[string]) =
   var whereClauses: seq[string] = @[]
@@ -339,10 +362,19 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
   if msg.event.kind == 5:
     for tag in msg.event.tags:
       if tag.len > 1 and tag[0] == "e":
-        if not deleteEventByIdAndPubkey(tag[1], msg.event.pubkey):
-          await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
-              result: false, message: "error: failed to delete event")))
-          return
+        var x = getEventById(tag[1])
+        if x.isSome():
+          var ev = x.get()
+          if ev.kind == 1059:
+            if not deleteEventByIdAndKindAndPtag(tag[1], 1059, msg.event.pubkey):
+              await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+                  result: false, message: "error: failed to delete event")))
+              return
+          else:
+            if not deleteEventByIdAndPubkey(tag[1], msg.event.pubkey):
+              await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+                  result: false, message: "error: failed to delete event")))
+              return
   elif msg.event.kind >= 20000 and msg.event.kind < 30000:
     # Ephemeral events: broadcast only, don't save to database
     discard
