@@ -5,7 +5,8 @@ import json, jsony, options, sequtils
 import secp256k1
 import nimcrypto/[sha2, hash]
 import db_connector/db_postgres
-import std/strformat
+import std/locks
+from std/logging import newConsoleLogger, lvlInfo, lvlWarn, lvlError, log
 from std/times import getTime, toUnix
 from std/os import parentDir, `/`, splitFile, fileExists, getEnv
 
@@ -81,6 +82,8 @@ var
   mimedb{.threadvar.}: mimetypes.MimeDB
   db{.threadvar.}: DbConn
 
+var loggerLock : Lock
+let logger {.guard : loggerLock.} = newConsoleLogger()
 
 const SCHEMA_SQLS = [
   """
@@ -412,10 +415,9 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
           asyncCheck sub.ws.send(eventJson)
 
 
-proc doREQ(ws: WebSocket, msg: MsgRequest) {.async.} =
+proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
   subscriptions.add Subscription(ws: ws, id: msg.subscriptionId,
       filters: msg.filters)
-  let now = getTime().toUnix()
   for filter in msg.filters:
     try:
       let (query, params) = buildQueryFromFilter(filter)
@@ -443,7 +445,9 @@ proc doREQ(ws: WebSocket, msg: MsgRequest) {.async.} =
         let eventJson = toJson(%*["EVENT", msg.subscriptionId, event])
         await ws.send(eventJson)
     except:
-      echo "Failed to query events from database: ", getCurrentExceptionMsg()
+      withLock loggerLock:
+        {.cast(gcsafe).}:
+          logger.log(lvlError, "Failed to query events from database: ", getCurrentExceptionMsg())
 
   await ws.send(toResponseJson(MsgResponse(kind: kEOSE,
       eoseSubscriptionId: msg.subscriptionId)))
@@ -456,6 +460,9 @@ proc doCLOSE(ws: WebSocket, msg: MsgRequest) =
 proc process(ws: WebSocket) {.async, gcsafe.} =
   try:
     let packet = await ws.receiveStrPacket()
+    withLock loggerLock:
+      {.cast(gcsafe).}:
+        logger.log(lvlInfo, packet)
     let msg = packet.parseRequest()
 
     case msg.kind:
@@ -480,7 +487,9 @@ proc cb(req: Request) {.async, gcsafe.} =
     except WebSocketClosedError:
       return
     except:
-      echo "Unexpected error: ", getCurrentExceptionMsg()
+      withLock loggerLock:
+        {.cast(gcsafe).}:
+          logger.log(lvlError, "Unexpected error: "  , getCurrentExceptionMsg())
       return
 
   elif req.headers.getOrDefault("accept") == "application/nostr+json":
@@ -497,6 +506,8 @@ proc cb(req: Request) {.async, gcsafe.} =
       return
     await req.respond(Http404, "Not Found\n")
 
+initLock(loggerLock)
+
 let dbUrl = getEnv("DATABASE_URL", "")
 if dbUrl.len > 0:
   # Parse DATABASE_URL (format: postgres://user:password@host:port/dbname)
@@ -508,15 +519,15 @@ else:
   let dbName = getEnv("DB_NAME", "nostr")
   db = open(dbHost, dbUser, dbPass, dbName)
 
-echo "Connected to PostgreSQL database"
+logger.log(lvlInfo, "Connected to PostgreSQL database")
 
 # Initialize database schema
 try:
   for sqlStmt in SCHEMA_SQLS:
     db.exec(sql(sqlStmt))
-  echo "Database schema initialized"
+  logger.log(lvlInfo, "Database schema initialized")
 except:
-  echo "Warning: Failed to initialize schema: ", getCurrentExceptionMsg()
+  logger.log(lvlWarn, "Warning: Failed to initialize schema: ", getCurrentExceptionMsg())
 
 mimedb = newMimetypes()
 var server = newAsyncHttpServer()
@@ -550,7 +561,7 @@ when defined(windows):
 
   discard SetConsoleCtrlHandler(cast[pointer](consoleCtrlHandler), 1)
 
-echo "Starting server on port 9001..."
+logger.log(lvlInfo, "Starting server on port 9001...")
 
 # Start server in async manner
 asyncCheck server.serve(Port(9001), cb)
@@ -559,5 +570,5 @@ asyncCheck server.serve(Port(9001), cb)
 while keepRunning:
   poll(100)
 
-echo "Server stopped."
+logger.log(lvlInfo, "Starting stopped.")
 db.close()
