@@ -82,8 +82,8 @@ var
   mimedb{.threadvar.}: mimetypes.MimeDB
   db{.threadvar.}: DbConn
 
-var loggerLock : Lock
-let logger {.guard : loggerLock.} = newConsoleLogger()
+var loggerLock: Lock
+let logger {.guard: loggerLock.} = newConsoleLogger()
 
 const SCHEMA_SQLS = [
   """
@@ -369,14 +369,17 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
         if x.isSome():
           var ev = x.get()
           if ev.kind == 1059:
-            if not deleteEventByIdAndKindAndPtag(tag[1], 1059, msg.event.pubkey):
-              await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
-                  result: false, message: "error: failed to delete event")))
+            if not deleteEventByIdAndKindAndPtag(tag[1], 1059,
+                msg.event.pubkey):
+              await ws.send(toResponseJson(MsgResponse(kind: kOK,
+                  id: msg.event.id, result: false,
+                  message: "error: failed to delete event")))
               return
           else:
             if not deleteEventByIdAndPubkey(tag[1], msg.event.pubkey):
-              await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
-                  result: false, message: "error: failed to delete event")))
+              await ws.send(toResponseJson(MsgResponse(kind: kOK,
+                  id: msg.event.id, result: false,
+                  message: "error: failed to delete event")))
               return
   elif msg.event.kind >= 20000 and msg.event.kind < 30000:
     # Ephemeral events: broadcast only, don't save to database
@@ -447,7 +450,8 @@ proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
     except:
       withLock loggerLock:
         {.cast(gcsafe).}:
-          logger.log(lvlError, "Failed to query events from database: ", getCurrentExceptionMsg())
+          logger.log(lvlError, "Failed to query events from database: ",
+              getCurrentExceptionMsg())
 
   await ws.send(toResponseJson(MsgResponse(kind: kEOSE,
       eoseSubscriptionId: msg.subscriptionId)))
@@ -489,7 +493,7 @@ proc cb(req: Request) {.async, gcsafe.} =
     except:
       withLock loggerLock:
         {.cast(gcsafe).}:
-          logger.log(lvlError, "Unexpected error: "  , getCurrentExceptionMsg())
+          logger.log(lvlError, "Unexpected error: ", getCurrentExceptionMsg())
       return
 
   elif req.headers.getOrDefault("accept") == "application/nostr+json":
@@ -527,7 +531,8 @@ try:
     db.exec(sql(sqlStmt))
   logger.log(lvlInfo, "Database schema initialized")
 except:
-  logger.log(lvlWarn, "Warning: Failed to initialize schema: ", getCurrentExceptionMsg())
+  logger.log(lvlWarn, "Warning: Failed to initialize schema: ",
+      getCurrentExceptionMsg())
 
 mimedb = newMimetypes()
 var server = newAsyncHttpServer()
