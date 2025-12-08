@@ -62,7 +62,7 @@ type
     case kind*: ResponseKind
     of kOK:
       id*: string
-      result_*: bool
+      resultValue*: bool
       message*: string
     of kNOTICE:
       notice*: string
@@ -137,7 +137,7 @@ proc parseRequest(jsonStr: string): MsgRequest =
 proc toResponseJson(response: MsgResponse): string =
   case response.kind
   of kOK:
-    return toJson(%*["OK", response.id, response.result_, response.message])
+    return toJson(%*["OK", response.id, response.resultValue, response.message])
   of kNOTICE:
     return toJson(%*["NOTICE", response.notice])
   of kEOSE:
@@ -354,12 +354,12 @@ proc buildQueryFromFilter(filter: Filter): (string, seq[string]) =
 proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
   if not isValidEvent(msg.event):
     await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
-        result_: false, message: "invalid: event is invalid")))
+        resultValue: false, message: "invalid: event is invalid")))
     return
 
   if not verifyEvent(msg.event):
     await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
-        result_: false, message: "invalid: signature verification failed")))
+        resultValue: false, message: "invalid: signature verification failed")))
     return
 
   if msg.event.kind == 5:
@@ -372,13 +372,13 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
             if not deleteEventByIdAndKindAndPtag(tag[1], 1059,
                 msg.event.pubkey):
               await ws.send(toResponseJson(MsgResponse(kind: kOK,
-                  id: msg.event.id, result_: false,
+                  id: msg.event.id, resultValue: false,
                   message: "error: failed to delete event")))
               return
           else:
             if not deleteEventByIdAndPubkey(tag[1], msg.event.pubkey):
               await ws.send(toResponseJson(MsgResponse(kind: kOK,
-                  id: msg.event.id, result_: false,
+                  id: msg.event.id, resultValue: false,
                   message: "error: failed to delete event")))
               return
   elif msg.event.kind >= 20000 and msg.event.kind < 30000:
@@ -390,7 +390,7 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
       if not deleteEventByKindAndPubkey(msg.event.kind, msg.event.pubkey,
           msg.event.created_at):
         await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
-            result_: false, message: "error: failed to delete event")))
+            resultValue: false, message: "error: failed to delete event")))
         return
     elif msg.event.kind >= 30000 and msg.event.kind < 40000:
       for tag in msg.event.tags:
@@ -398,18 +398,18 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
           if not deleteEventByKindAndPubkeyAndDtag(msg.event.kind,
               msg.event.pubkey, tag[1], msg.event.created_at):
             await ws.send(toResponseJson(MsgResponse(kind: kOK,
-                id: msg.event.id, result_: false,
+                id: msg.event.id, resultValue: false,
                 message: "error: failed to delete event")))
             return
       discard
 
     if not saveEvent(msg.event):
       await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
-          result_: false, message: "error: failed to save event")))
+          resultValue: false, message: "error: failed to save event")))
       return
 
   await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
-      result_: true, message: "")))
+      resultValue: true, message: "")))
   for sub in subscriptions:
     for filter in sub.filters:
       if filterMatch(msg.event, filter):
