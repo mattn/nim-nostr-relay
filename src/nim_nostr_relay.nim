@@ -5,10 +5,10 @@ import json, jsony, options, sequtils
 import secp256k1
 import nimcrypto/[sha2, hash]
 import db_connector/db_postgres
-import std/locks
-from std/logging import newConsoleLogger, lvlInfo, lvlWarn, lvlError, log
-from std/times import getTime, toUnix
-from std/os import parentDir, `/`, splitFile, fileExists, getEnv
+import locks
+from logging import newConsoleLogger, lvlInfo, lvlWarn, lvlError, log
+from times import getTime, toUnix
+from os import parentDir, `/`, splitFile, fileExists, getEnv
 
 when defined(posix):
   from std/posix import onSignal, SIGINT, SIGTERM
@@ -463,7 +463,10 @@ proc doCLOSE(ws: WebSocket, msg: MsgRequest) =
 
 proc process(ws: WebSocket) {.async, gcsafe.} =
   try:
-    let packet = await ws.receiveStrPacket()
+    let packet = strip(await ws.receiveStrPacket())
+    if packet.len == 0:
+      return
+
     withLock loggerLock:
       {.cast(gcsafe).}:
         logger.log(lvlInfo, packet)
