@@ -506,7 +506,7 @@ proc cb(req: Request) {.async, gcsafe.} =
     if filename == "/":
       filename = "/index.html"
 
-    filename = currentSourcePath().parentDir / "public" / filename
+    filename = "public" / filename
     if fileExists(filename):
       await req.respond(Http200, readFile(filename), newHttpHeaders({
           "Content-Type": getMimeType(mimedb, splitFile(filename).ext)}))
