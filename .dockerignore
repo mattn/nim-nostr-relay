@@ -13,5 +13,6 @@ htmldocs/
 README.md
 schema.sql
 setenv.sh
+update.sh
 nim-nostr-relay
 kustomize
