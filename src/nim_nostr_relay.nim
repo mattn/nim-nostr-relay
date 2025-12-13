@@ -83,7 +83,7 @@ var
   db{.threadvar.}: DbConn
 
 var loggerLock: Lock
-let logger {.guard: loggerLock.} = newConsoleLogger()
+let logger {.guard: loggerLock.} = newConsoleLogger(lvlInfo, fmtStr = "$datetime [$levelname]$appname:")
 
 const SCHEMA_SQLS = [
   """
