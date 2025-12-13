@@ -499,8 +499,19 @@ proc cb(req: Request) {.async, gcsafe.} =
           logger.log(lvlError, "Unexpected error: ", getCurrentExceptionMsg())
       return
 
-  elif req.headers.getOrDefault("accept") == "application/nostr+json":
-    await req.respond(Http200, "{}")
+  elif req.url.path == "/" and req.headers.getOrDefault("accept") == "application/nostr+json":
+    # NIP-11: Relay Information Document
+    let relayInfo = %*{
+      "name": getEnv("RELAY_NAME", "nim-nostr-relay"),
+      "description": getEnv("RELAY_DESCRIPTION", "A Nostr relay written in Nim"),
+      "pubkey": getEnv("RELAY_PUBKEY", ""),
+      "contact": getEnv("RELAY_CONTACT", ""),
+      "supported_nips": [1, 2, 4, 9, 11, 12, 15, 16, 20, 33, 40],
+      "software": "https://github.com/mattn/nim-nostr-relay",
+      "version": "0.0.1"
+    }
+    await req.respond(Http200, toJson(relayInfo), newHttpHeaders({
+        "Content-Type": "application/nostr+json", "Access-Control-Allow-Origin": "*"}))
   else:
     var filename = decodeUrl(req.url.path)
     if filename == "/":
