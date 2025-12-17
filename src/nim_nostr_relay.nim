@@ -506,6 +506,7 @@ proc cb(req: Request) {.async, gcsafe.} =
       "description": getEnv("RELAY_DESCRIPTION", "A Nostr relay written in Nim"),
       "pubkey": getEnv("RELAY_PUBKEY", ""),
       "contact": getEnv("RELAY_CONTACT", ""),
+      "icon": getEnv("RELAY_ICON", ""),
       "supported_nips": [1, 2, 4, 9, 11, 12, 15, 16, 20, 33, 40],
       "software": "https://github.com/mattn/nim-nostr-relay",
       "version": "0.0.1"
