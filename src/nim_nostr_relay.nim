@@ -85,6 +85,29 @@ var
 var loggerLock: Lock
 let logger {.guard: loggerLock.} = newConsoleLogger(lvlInfo, fmtStr = "$datetime [$levelname]$appname:")
 
+proc reconnectDb() =
+  try:
+    if not db.isNil:
+      db.close()
+  except:
+    discard
+  let dbUrl = getEnv("DATABASE_URL", "")
+  if dbUrl.len > 0:
+    db = open("", "", "", dbUrl)
+  else:
+    let dbHost = getEnv("DB_HOST", "localhost")
+    let dbUser = getEnv("DB_USER", "postgres")
+    let dbPass = getEnv("DB_PASS", "")
+    let dbName = getEnv("DB_NAME", "nostr")
+    db = open(dbHost, dbUser, dbPass, dbName)
+
+template withDbRetry(body: untyped): untyped =
+  try:
+    body
+  except DbError:
+    reconnectDb()
+    body
+
 const SCHEMA_SQLS = [
   """
 CREATE OR REPLACE FUNCTION tags_to_tagvalues(jsonb) RETURNS text[]
@@ -237,7 +260,8 @@ proc isValidEvent(event: Event): bool =
 
 proc deleteEventByIdAndPubkey(id: string, pubkey: string): bool =
   try:
-    db.exec(sql"DELETE FROM event WHERE id = ? AND pubkey = ?", id, pubkey)
+    withDbRetry:
+      db.exec(sql"DELETE FROM event WHERE id = ? AND pubkey = ?", id, pubkey)
     return true
   except DbError:
     return false
@@ -245,8 +269,9 @@ proc deleteEventByIdAndPubkey(id: string, pubkey: string): bool =
 proc deleteEventByKindAndPubkey(kind: int, pubkey: string,
     created_at: int): bool =
   try:
-    db.exec(sql"DELETE FROM event WHERE kind = ? AND pubkey = ? AND created_at <= ?",
-        kind, pubkey, created_at)
+    withDbRetry:
+      db.exec(sql"DELETE FROM event WHERE kind = ? AND pubkey = ? AND created_at <= ?",
+          kind, pubkey, created_at)
     return true
   except DbError:
     return false
@@ -254,44 +279,48 @@ proc deleteEventByKindAndPubkey(kind: int, pubkey: string,
 proc deleteEventByKindAndPubkeyAndDtag(kind: int, pubkey: string, dtag: string,
     created_at: int): bool =
   try:
-    db.exec(sql"DELETE FROM event WHERE kind = ? AND pubkey = ? AND tags @> ?::jsonb AND created_at <= ?",
-        kind, pubkey, ["d", dtag].toJson(), created_at)
+    withDbRetry:
+      db.exec(sql"DELETE FROM event WHERE kind = ? AND pubkey = ? AND tags @> ?::jsonb AND created_at <= ?",
+          kind, pubkey, ["d", dtag].toJson(), created_at)
     return true
   except DbError:
     return false
 
 proc deleteEventByIdAndKindAndPtag(id: string, kind: int, ptag: string): bool =
   try:
-    db.exec(sql"DELETE FROM event WHERE id = ? AND kind = ? AND tags @> ?::jsonb",
-        id, kind, ["p", ptag].toJson())
+    withDbRetry:
+      db.exec(sql"DELETE FROM event WHERE id = ? AND kind = ? AND tags @> ?::jsonb",
+          id, kind, ["p", ptag].toJson())
     return true
   except DbError:
     return false
 
 proc saveEvent(event: Event): bool =
   try:
-    db.exec(sql"""
-      INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
-      VALUES (?, ?, ?, ?, ?::jsonb, ?, ?)
-      ON CONFLICT (id) DO NOTHING
-    """, event.id, event.pubkey, event.created_at, event.kind,
-        toJson(event.tags), event.content, event.sig)
+    withDbRetry:
+      db.exec(sql"""
+        INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig)
+        VALUES (?, ?, ?, ?, ?::jsonb, ?, ?)
+        ON CONFLICT (id) DO NOTHING
+      """, event.id, event.pubkey, event.created_at, event.kind,
+          toJson(event.tags), event.content, event.sig)
     return true
   except DbError:
     return false
 
 proc getEventById(id: string): Option[Event] =
-  var row = db.getRow(sql("SELECT id, pubkey, created_at, kind, tags, content, sig FROM event WHERE id = ?"), [id])
-  if row[0] != "":
-    return option(Event(
-      id: row[0],
-      pubkey: row[1],
-      created_at: parseInt(row[2]),
-      kind: parseInt(row[3]),
-      tags: fromJson(row[4], seq[seq[string]]),
-      content: row[5],
-      sig: row[6]
-    ))
+  withDbRetry:
+    var row = db.getRow(sql("SELECT id, pubkey, created_at, kind, tags, content, sig FROM event WHERE id = ?"), [id])
+    if row[0] != "":
+      return option(Event(
+        id: row[0],
+        pubkey: row[1],
+        created_at: parseInt(row[2]),
+        kind: parseInt(row[3]),
+        tags: fromJson(row[4], seq[seq[string]]),
+        content: row[5],
+        sig: row[6]
+      ))
   return none(Event)
 
 proc buildQueryFromFilter(filter: Filter): (string, seq[string]) =
@@ -424,29 +453,30 @@ proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
   for filter in msg.filters:
     try:
       let (query, params) = buildQueryFromFilter(filter)
-      for row in db.rows(sql(query), params):
-        let tags = fromJson(row[4], seq[seq[string]])
+      withDbRetry:
+        for row in db.rows(sql(query), params):
+          let tags = fromJson(row[4], seq[seq[string]])
 
-        var expired = false
-        for tag in tags:
-          if tag.len > 0 and tag[0] == "expiration" and parseInt(tag[1]) <=
-              getTime().toUnix():
-            expired = true
-            break
-        if expired:
-          continue
-        let event = Event(
-          id: row[0],
-          pubkey: row[1],
-          created_at: parseInt(row[2]),
-          kind: parseInt(row[3]),
-          tags: tags,
-          content: row[5],
-          sig: row[6]
-        )
+          var expired = false
+          for tag in tags:
+            if tag.len > 0 and tag[0] == "expiration" and parseInt(tag[1]) <=
+                getTime().toUnix():
+              expired = true
+              break
+          if expired:
+            continue
+          let event = Event(
+            id: row[0],
+            pubkey: row[1],
+            created_at: parseInt(row[2]),
+            kind: parseInt(row[3]),
+            tags: tags,
+            content: row[5],
+            sig: row[6]
+          )
 
-        let eventJson = toJson(%*["EVENT", msg.subscriptionId, event])
-        await ws.send(eventJson)
+          let eventJson = toJson(%*["EVENT", msg.subscriptionId, event])
+          await ws.send(eventJson)
     except:
       withLock loggerLock:
         {.cast(gcsafe).}:
@@ -527,16 +557,7 @@ proc cb(req: Request) {.async, gcsafe.} =
 
 initLock(loggerLock)
 
-let dbUrl = getEnv("DATABASE_URL", "")
-if dbUrl.len > 0:
-  # Parse DATABASE_URL (format: postgres://user:password@host:port/dbname)
-  db = open("", "", "", dbUrl)
-else:
-  let dbHost = getEnv("DB_HOST", "localhost")
-  let dbUser = getEnv("DB_USER", "postgres")
-  let dbPass = getEnv("DB_PASS", "")
-  let dbName = getEnv("DB_NAME", "nostr")
-  db = open(dbHost, dbUser, dbPass, dbName)
+reconnectDb()
 
 logger.log(lvlInfo, "Connected to PostgreSQL database")
 
