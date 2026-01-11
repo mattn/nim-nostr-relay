@@ -517,16 +517,20 @@ proc process(ws: WebSocket) {.async, gcsafe.} =
 
 proc cb(req: Request) {.async, gcsafe.} =
   if req.url.path == "/" and req.headers.getOrDefault("Upgrade") == "websocket":
+    var ws = WebSocket(nil)
     try:
-      var ws = await newWebSocket(req)
+      ws = await newWebSocket(req)
       while ws.readyState == Open:
         await process(ws)
     except WebSocketClosedError:
+      subscriptions.keepItIf(it.ws != ws)
       return
     except:
       withLock loggerLock:
         {.cast(gcsafe).}:
           logger.log(lvlError, "Unexpected error: ", getCurrentExceptionMsg())
+      if not ws.isNil:
+        subscriptions.keepItIf(it.ws != ws)
       return
 
   elif req.url.path == "/" and req.headers.getOrDefault("accept") == "application/nostr+json":
