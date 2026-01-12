@@ -1,7 +1,7 @@
 import asyncdispatch, asynchttpserver, ws
 import uri
 import strutils
-import json, jsony, options, sequtils
+import json, jsony, options, sequtils, tables
 import secp256k1
 import nimcrypto/[sha2, hash]
 import db_connector/db_postgres
@@ -78,7 +78,7 @@ type
 
 
 var
-  subscriptions{.threadvar.}: seq[Subscription]
+  subscriptions{.threadvar.}: Table[string, Subscription]
   mimedb{.threadvar.}: mimetypes.MimeDB
   db{.threadvar.}: DbConn
 
@@ -439,7 +439,7 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
 
   await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
       resultValue: true, message: "")))
-  for sub in subscriptions:
+  for sub in subscriptions.values:
     for filter in sub.filters:
       if filterMatch(msg.event, filter):
         let eventJson = toJson(%*["EVENT", sub.id, msg.event])
@@ -448,7 +448,7 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
 
 
 proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
-  subscriptions.add Subscription(ws: ws, id: msg.subscriptionId,
+  subscriptions[msg.subscriptionId] = Subscription(ws: ws, id: msg.subscriptionId,
       filters: msg.filters)
   for filter in msg.filters:
     try:
@@ -488,7 +488,7 @@ proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
 
 
 proc doCLOSE(ws: WebSocket, msg: MsgRequest) =
-  subscriptions.keepItIf(it.ws != ws or it.id != msg.closeSubscriptionId)
+  subscriptions.del(msg.closeSubscriptionId)
 
 
 proc process(ws: WebSocket) {.async, gcsafe.} =
@@ -523,14 +523,24 @@ proc cb(req: Request) {.async, gcsafe.} =
       while ws.readyState == Open:
         await process(ws)
     except WebSocketClosedError:
-      subscriptions.keepItIf(it.ws != ws)
+      var toDelete: seq[string]
+      for key, sub in subscriptions.pairs:
+        if sub.ws == ws:
+          toDelete.add(key)
+      for key in toDelete:
+        subscriptions.del(key)
       return
     except:
       withLock loggerLock:
         {.cast(gcsafe).}:
           logger.log(lvlError, "Unexpected error: ", getCurrentExceptionMsg())
       if not ws.isNil:
-        subscriptions.keepItIf(it.ws != ws)
+        var toDelete: seq[string]
+        for key, sub in subscriptions.pairs:
+          if sub.ws == ws:
+            toDelete.add(key)
+        for key in toDelete:
+          subscriptions.del(key)
       return
 
   elif req.url.path == "/" and req.headers.getOrDefault("accept") == "application/nostr+json":
