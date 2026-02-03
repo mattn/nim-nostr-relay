@@ -380,6 +380,12 @@ proc buildQueryFromFilter(filter: Filter): (string, seq[string]) =
 
   return (query, params)
 
+proc isProtectedEvent(event: Event): bool =
+  for tag in event.tags:
+    if tag.len == 1 and tag[0] == "-":
+      return true
+  return false
+
 proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
   if not isValidEvent(msg.event):
     await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
@@ -389,6 +395,12 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
   if not verifyEvent(msg.event):
     await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
         resultValue: false, message: "invalid: signature verification failed")))
+    return
+
+  # NIP-70: Protected events - reject events with ["-"] tag
+  if isProtectedEvent(msg.event):
+    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+        resultValue: false, message: "auth-required: this event may only be published by its author")))
     return
 
   if msg.event.kind == 5:
@@ -551,7 +563,7 @@ proc cb(req: Request) {.async, gcsafe.} =
       "pubkey": getEnv("RELAY_PUBKEY", ""),
       "contact": getEnv("RELAY_CONTACT", ""),
       "icon": getEnv("RELAY_ICON", ""),
-      "supported_nips": [1, 2, 4, 9, 11, 12, 15, 16, 20, 33, 40],
+      "supported_nips": [1, 2, 4, 9, 11, 12, 15, 16, 20, 33, 40, 70],
       "software": "https://github.com/mattn/nim-nostr-relay",
       "version": "0.0.1"
     }
