@@ -451,12 +451,23 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
 
   await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
       resultValue: true, message: "")))
+
+  # Broadcast to matching subscriptions
+  var broadcastTargets: seq[tuple[ws: WebSocket, eventJson: string]]
   for sub in subscriptions.values:
     for filter in sub.filters:
       if filterMatch(msg.event, filter):
         let eventJson = toJson(%*["EVENT", sub.id, msg.event])
         if sub.ws.readyState == Open:
-          asyncCheck sub.ws.send(eventJson)
+          broadcastTargets.add((sub.ws, eventJson))
+        break
+
+  for target in broadcastTargets:
+    try:
+      if target.ws.readyState == Open:
+        await target.ws.send(target.eventJson)
+    except:
+      cleanupWs(target.ws)
 
 
 proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
@@ -500,7 +511,20 @@ proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
 
 
 proc doCLOSE(ws: WebSocket, msg: MsgRequest) =
-  subscriptions.del(msg.closeSubscriptionId)
+  if subscriptions.hasKey(msg.closeSubscriptionId) and
+     subscriptions[msg.closeSubscriptionId].ws == ws:
+    subscriptions.del(msg.closeSubscriptionId)
+
+
+proc cleanupWs(ws: WebSocket) =
+  if ws.isNil:
+    return
+  var toDelete: seq[string]
+  for key, sub in subscriptions.pairs:
+    if sub.ws == ws:
+      toDelete.add(key)
+  for key in toDelete:
+    subscriptions.del(key)
 
 
 proc process(ws: WebSocket) {.async, gcsafe.} =
@@ -529,31 +553,19 @@ proc process(ws: WebSocket) {.async, gcsafe.} =
 
 proc cb(req: Request) {.async, gcsafe.} =
   if req.url.path == "/" and req.headers.getOrDefault("Upgrade") == "websocket":
-    var ws = WebSocket(nil)
+    var ws: WebSocket = nil
     try:
       ws = await newWebSocket(req)
       while ws.readyState == Open:
         await process(ws)
     except WebSocketClosedError:
-      var toDelete: seq[string]
-      for key, sub in subscriptions.pairs:
-        if sub.ws == ws:
-          toDelete.add(key)
-      for key in toDelete:
-        subscriptions.del(key)
-      return
+      discard
     except:
       withLock loggerLock:
         {.cast(gcsafe).}:
           logger.log(lvlError, "Unexpected error: ", getCurrentExceptionMsg())
-      if not ws.isNil:
-        var toDelete: seq[string]
-        for key, sub in subscriptions.pairs:
-          if sub.ws == ws:
-            toDelete.add(key)
-        for key in toDelete:
-          subscriptions.del(key)
-      return
+    finally:
+      cleanupWs(ws)
 
   elif req.url.path == "/" and req.headers.getOrDefault("accept") == "application/nostr+json":
     # NIP-11: Relay Information Document
