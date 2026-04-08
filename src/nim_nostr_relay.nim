@@ -141,20 +141,32 @@ proc parseRequest(jsonStr: string): MsgRequest =
   let node = jsonStr.parseJson()
   if node.kind != JArray:
     raise newException(ValueError, "Nostr message must be an array")
+  if node.len == 0:
+    raise newException(ValueError, "Nostr message must not be empty")
+  if node[0].kind != JString:
+    raise newException(ValueError, "Nostr message type must be a string")
 
   let tag = node[0].getStr()
   case tag
   of "EVENT":
+    if node.len < 2:
+      raise newException(ValueError, "EVENT message must include an event")
     let ev = node[1].to(Event)
     return MsgRequest(kind: kEVENT, event: ev)
   of "REQ":
+    if node.len < 2:
+      raise newException(ValueError, "REQ message must include a subscription id")
     let subId = node[1].getStr()
     var filters: seq[Filter]
     for i in 2 ..< node.len:
       filters.add node[i].to(Filter)
     return MsgRequest(kind: kREQ, subscriptionId: subId, filters: filters)
   of "CLOSE":
+    if node.len < 2:
+      raise newException(ValueError, "CLOSE message must include a subscription id")
     return MsgRequest(kind: kCLOSE, closeSubscriptionId: node[1].getStr())
+  else:
+    raise newException(ValueError, "Unsupported message type: " & tag)
 
 
 proc toResponseJson(response: MsgResponse): string =
@@ -206,11 +218,12 @@ proc filterMatch(event: Event, filter: Filter): bool =
   if filter.tags.isSome:
     for reqTag in filter.tags.get():
       var foundTag = false
-      for eventTag in event.tags:
-        if eventTag.len > 1 and eventTag[0] == reqTag[0] and eventTag[1] ==
-            reqTag[1]:
-          foundTag = true
-          break
+      if reqTag.len > 1:
+        for eventTag in event.tags:
+          if eventTag.len > 1 and eventTag[0] == reqTag[0] and eventTag[1] ==
+              reqTag[1]:
+            foundTag = true
+            break
       match = match and foundTag
 
   return match
@@ -482,7 +495,7 @@ proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
 
           var expired = false
           for tag in tags:
-            if tag.len > 0 and tag[0] == "expiration" and parseInt(tag[1]) <=
+            if tag.len > 1 and tag[0] == "expiration" and parseInt(tag[1]) <=
                 getTime().toUnix():
               expired = true
               break
@@ -549,6 +562,9 @@ proc process(ws: WebSocket) {.async, gcsafe.} =
   except JsonParsingError:
     await ws.send(toResponseJson(MsgResponse(kind: kNOTICE,
         notice: "Unknown payload format")))
+  except ValueError:
+    await ws.send(toResponseJson(MsgResponse(kind: kNOTICE,
+        notice: getCurrentExceptionMsg())))
 
 
 proc cb(req: Request) {.async, gcsafe.} =
