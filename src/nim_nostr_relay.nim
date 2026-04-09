@@ -399,6 +399,16 @@ proc isProtectedEvent(event: Event): bool =
       return true
   return false
 
+proc cleanupWs(ws: WebSocket) =
+  if ws.isNil:
+    return
+  var toDelete: seq[string]
+  for key, sub in subscriptions.pairs:
+    if sub.ws == ws:
+      toDelete.add(key)
+  for key in toDelete:
+    subscriptions.del(key)
+
 proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
   if not isValidEvent(msg.event):
     await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
@@ -527,17 +537,6 @@ proc doCLOSE(ws: WebSocket, msg: MsgRequest) =
   if subscriptions.hasKey(msg.closeSubscriptionId) and
      subscriptions[msg.closeSubscriptionId].ws == ws:
     subscriptions.del(msg.closeSubscriptionId)
-
-
-proc cleanupWs(ws: WebSocket) =
-  if ws.isNil:
-    return
-  var toDelete: seq[string]
-  for key, sub in subscriptions.pairs:
-    if sub.ws == ws:
-      toDelete.add(key)
-  for key in toDelete:
-    subscriptions.del(key)
 
 
 proc process(ws: WebSocket) {.async, gcsafe.} =
