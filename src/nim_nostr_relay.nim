@@ -592,7 +592,8 @@ proc cb(req: Request) {.async, gcsafe.} =
       "icon": getEnv("RELAY_ICON", ""),
       "supported_nips": [1, 2, 4, 9, 11, 12, 15, 16, 20, 33, 40, 70],
       "software": "https://github.com/mattn/nim-nostr-relay",
-      "version": "0.0.1"
+      "version": "0.0.1",
+      "relay_countries": getEnv("RELAY_COUNTRIES", "JP").split(',').mapIt(it.strip()).filterIt(it.len > 0)
     }
     await req.respond(Http200, toJson(relayInfo), newHttpHeaders({
         "Content-Type": "application/nostr+json", "Access-Control-Allow-Origin": "*"}))
