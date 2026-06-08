@@ -539,7 +539,20 @@ proc doCLOSE(ws: WebSocket, msg: MsgRequest) =
     subscriptions.del(msg.closeSubscriptionId)
 
 
-proc process(ws: WebSocket) {.async, gcsafe.} =
+# Extract the real client IP from proxy headers (e.g. Cloudflare Tunnel /
+# reverse proxy). Falls back to the peer address, or "-" when unknown.
+proc extractClientIp(req: Request): string =
+  for name in ["cf-connecting-ip", "x-forwarded-for", "x-real-ip"]:
+    let value = req.headers.getOrDefault(name).strip()
+    if value.len > 0:
+      # X-Forwarded-For may be a comma separated list; take the first entry.
+      return value.split(',')[0].strip()
+  if req.hostname.len > 0:
+    return req.hostname
+  return "-"
+
+
+proc process(ws: WebSocket, clientIp: string) {.async, gcsafe.} =
   try:
     let packet = strip(await ws.receiveStrPacket())
     if packet.len == 0:
@@ -547,7 +560,7 @@ proc process(ws: WebSocket) {.async, gcsafe.} =
 
     withLock loggerLock:
       {.cast(gcsafe).}:
-        logger.log(lvlInfo, packet)
+        logger.log(lvlInfo, "[", clientIp, "] ", packet)
     let msg = packet.parseRequest()
 
     case msg.kind:
@@ -569,17 +582,25 @@ proc process(ws: WebSocket) {.async, gcsafe.} =
 proc cb(req: Request) {.async, gcsafe.} =
   if req.url.path == "/" and req.headers.getOrDefault("Upgrade") == "websocket":
     var ws: WebSocket = nil
+    let clientIp = extractClientIp(req)
     try:
       ws = await newWebSocket(req)
+      withLock loggerLock:
+        {.cast(gcsafe).}:
+          logger.log(lvlInfo, "[", clientIp, "] Client connected")
       while ws.readyState == Open:
-        await process(ws)
+        await process(ws, clientIp)
     except WebSocketClosedError:
       discard
     except:
       withLock loggerLock:
         {.cast(gcsafe).}:
-          logger.log(lvlError, "Unexpected error: ", getCurrentExceptionMsg())
+          logger.log(lvlError, "[", clientIp, "] Unexpected error: ",
+              getCurrentExceptionMsg())
     finally:
+      withLock loggerLock:
+        {.cast(gcsafe).}:
+          logger.log(lvlInfo, "[", clientIp, "] Client disconnected")
       cleanupWs(ws)
 
   elif req.url.path == "/" and req.headers.getOrDefault("accept") == "application/nostr+json":
