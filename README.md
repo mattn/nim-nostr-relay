@@ -9,6 +9,7 @@ This relay supports the following Nostr Implementation Possibilities (NIPs):
 - **NIP-01**: Basic protocol flow
 - **NIP-11**: Relay Information Document
 - **NIP-20**: Command results (OK messages)
+- **NIP-26**: Delegated event signing
 
 ## Usage
 
