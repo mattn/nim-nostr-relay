@@ -19,6 +19,7 @@ type
   RequestKind = enum
     kEVENT = "EVENT"
     kREQ = "REQ"
+    kCOUNT = "COUNT"
     kCLOSE = "CLOSE"
 
   ResponseKind = enum
@@ -52,7 +53,7 @@ type
     case kind*: RequestKind
     of kEVENT:
       event*: Event
-    of kREQ:
+    of kREQ, kCOUNT:
       subscriptionId*: string
       filters*: seq[Filter]
     of kCLOSE:
@@ -161,6 +162,14 @@ proc parseRequest(jsonStr: string): MsgRequest =
     for i in 2 ..< node.len:
       filters.add node[i].to(Filter)
     return MsgRequest(kind: kREQ, subscriptionId: subId, filters: filters)
+  of "COUNT":
+    if node.len < 3:
+      raise newException(ValueError, "COUNT message must include a query id and filter")
+    let queryId = node[1].getStr()
+    var filters: seq[Filter]
+    for i in 2 ..< node.len:
+      filters.add node[i].to(Filter)
+    return MsgRequest(kind: kCOUNT, subscriptionId: queryId, filters: filters)
   of "CLOSE":
     if node.len < 2:
       raise newException(ValueError, "CLOSE message must include a subscription id")
@@ -428,7 +437,7 @@ proc getEventById(id: string): Option[Event] =
       ))
   return none(Event)
 
-proc buildQueryFromFilter(filter: Filter): (string, seq[string]) =
+proc buildQueryFromFilter(filter: Filter, countOnly = false): (string, seq[string]) =
   var whereClauses: seq[string] = @[]
   var params: seq[string] = @[]
 
@@ -472,16 +481,20 @@ proc buildQueryFromFilter(filter: Filter): (string, seq[string]) =
       params.add(ptag)
       whereClauses.add("? = ANY(tagvalues)")
 
-  var query = "SELECT id, pubkey, created_at, kind, tags, content, sig FROM event"
+  var query = if countOnly:
+      "SELECT id, tags FROM event"
+    else:
+      "SELECT id, pubkey, created_at, kind, tags, content, sig FROM event"
   if whereClauses.len > 0:
     query &= " WHERE " & whereClauses.join(" AND ")
 
-  query &= " ORDER BY created_at DESC"
+  if not countOnly:
+    query &= " ORDER BY created_at DESC"
 
-  if filter.limit.isSome:
-    query &= " LIMIT " & $filter.limit.get()
-  else:
-    query &= " LIMIT 500"
+    if filter.limit.isSome:
+      query &= " LIMIT " & $filter.limit.get()
+    else:
+      query &= " LIMIT 500"
 
   return (query, params)
 
@@ -631,6 +644,33 @@ proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
       eoseSubscriptionId: msg.subscriptionId)))
 
 
+proc doCOUNT(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
+  var eventIds = initTable[string, bool]()
+  try:
+    for filter in msg.filters:
+      let (query, params) = buildQueryFromFilter(filter, true)
+      withDbRetry:
+        for row in db.rows(sql(query), params):
+          let tags = fromJson(row[1], seq[seq[string]])
+          var expired = false
+          for tag in tags:
+            if tag.len > 1 and tag[0] == "expiration" and parseInt(tag[1]) <=
+                getTime().toUnix():
+              expired = true
+              break
+          if not expired:
+            eventIds[row[0]] = true
+    await ws.send(toJson(%*["COUNT", msg.subscriptionId,
+        {"count": eventIds.len}]))
+  except:
+    withLock loggerLock:
+      {.cast(gcsafe).}:
+        logger.log(lvlError, "Failed to count events from database: ",
+            getCurrentExceptionMsg())
+    await ws.send(toJson(%*["CLOSED", msg.subscriptionId,
+        "error: could not count events"]))
+
+
 proc doCLOSE(ws: WebSocket, msg: MsgRequest) =
   if subscriptions.hasKey(msg.closeSubscriptionId) and
      subscriptions[msg.closeSubscriptionId].ws == ws:
@@ -666,6 +706,8 @@ proc process(ws: WebSocket, clientIp: string) {.async, gcsafe.} =
       await doEVENT(ws, msg)
     of kREQ:
       await doREQ(ws, msg)
+    of kCOUNT:
+      await doCOUNT(ws, msg)
     of kCLOSE:
       doCLOSE(ws, msg)
 
@@ -709,7 +751,7 @@ proc cb(req: Request) {.async, gcsafe.} =
       "pubkey": getEnv("RELAY_PUBKEY", ""),
       "contact": getEnv("RELAY_CONTACT", ""),
       "icon": getEnv("RELAY_ICON", ""),
-      "supported_nips": [1, 4, 9, 11, 40, 66, 70, 78],
+      "supported_nips": [1, 4, 9, 11, 40, 45, 66, 70, 78],
       "software": "https://github.com/mattn/nim-nostr-relay",
       "version": "0.0.1",
       "relay_countries": getEnv("RELAY_COUNTRIES", "JP").split(',').mapIt(it.strip()).filterIt(it.len > 0)
