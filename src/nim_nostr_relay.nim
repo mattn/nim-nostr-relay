@@ -271,6 +271,98 @@ proc isValidEvent(event: Event): bool =
   # Placeholder for actual event validation logic
   return event.id.len > 0 and event.pubkey.len > 0 and event.sig.len > 0
 
+proc validateDelegationConditions(event: Event, conditions: string): bool =
+  # NIP-26: conditions is an &-separated query string, e.g.
+  # "kind=1&created_at>1674834236&created_at<1677426236"
+  var kindAllowed = false
+  var createdAtValid = true
+
+  for condition in conditions.split('&'):
+    if condition.startsWith("kind="):
+      try:
+        let allowedKind = parseInt(condition[5 .. ^1])
+        if event.kind == allowedKind:
+          kindAllowed = true
+      except ValueError:
+        discard
+    elif condition.startsWith("created_at<"):
+      try:
+        let maxTime = parseBiggestInt(condition[11 .. ^1])
+        if event.created_at >= maxTime:
+          createdAtValid = false
+      except ValueError:
+        discard
+    elif condition.startsWith("created_at>"):
+      try:
+        let minTime = parseBiggestInt(condition[11 .. ^1])
+        if event.created_at <= minTime:
+          createdAtValid = false
+      except ValueError:
+        discard
+
+  return kindAllowed and createdAtValid
+
+proc verifyDelegationSignature(delegateePubkey: string, delegatorPubkey: string,
+    conditions: string, signature: string): bool =
+  try:
+    # NIP-26: the delegation token is the sha256 hash of
+    # "nostr:delegation:<delegatee pubkey>:<conditions>", signed by the delegator
+    let delegationToken = "nostr:delegation:" & delegateePubkey & ":" & conditions
+
+    let hash = sha256.digest(delegationToken)
+
+    # Parse Schnorr signature and x-only public key from hex
+    let sigResult = SkSchnorrSignature.fromHex(signature)
+    if sigResult.isErr:
+      return false
+    let sig = sigResult.get()
+
+    let pubkeyResult = SkXOnlyPublicKey.fromHex(delegatorPubkey)
+    if pubkeyResult.isErr:
+      return false
+    let pubkey = pubkeyResult.get()
+
+    # Verify Schnorr signature
+    return sig.verify(hash.data, pubkey)
+  except:
+    return false
+
+proc validateDelegation(event: Event): bool =
+  # NIP-26: Delegated Event Signing
+  # ["delegation", <delegator pubkey>, <conditions>, <delegation token>]
+  var delegationTag: seq[string]
+  for tag in event.tags:
+    if tag.len >= 4 and tag[0] == "delegation":
+      delegationTag = tag
+      break
+
+  if delegationTag.len == 0:
+    return true
+
+  if delegationTag.len != 4:
+    return false
+
+  let delegatorPubkey = delegationTag[1]
+  let conditions = delegationTag[2]
+  let signature = delegationTag[3]
+
+  if delegatorPubkey.len == 0 or conditions.len == 0 or signature.len == 0:
+    return false
+
+  if delegatorPubkey.len != 64:
+    return false
+  if not delegatorPubkey.allIt(it in HexDigits):
+    return false
+
+  if not validateDelegationConditions(event, conditions):
+    return false
+
+  if not verifyDelegationSignature(event.pubkey, delegatorPubkey, conditions,
+      signature):
+    return false
+
+  return true
+
 proc deleteEventByIdAndPubkey(id: string, pubkey: string): bool =
   try:
     withDbRetry:
@@ -418,6 +510,12 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
   if not verifyEvent(msg.event):
     await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
         resultValue: false, message: "invalid: signature verification failed")))
+    return
+
+  # NIP-26: Delegated event signing - verify the delegation tag if present
+  if not validateDelegation(msg.event):
+    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+        resultValue: false, message: "invalid: delegation verification failed")))
     return
 
   # NIP-70: Protected events - reject events with ["-"] tag
