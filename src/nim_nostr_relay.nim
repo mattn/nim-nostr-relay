@@ -709,7 +709,7 @@ proc cb(req: Request) {.async, gcsafe.} =
       "pubkey": getEnv("RELAY_PUBKEY", ""),
       "contact": getEnv("RELAY_CONTACT", ""),
       "icon": getEnv("RELAY_ICON", ""),
-      "supported_nips": [1, 4, 9, 11, 40, 70, 78],
+      "supported_nips": [1, 4, 9, 11, 40, 66, 70, 78],
       "software": "https://github.com/mattn/nim-nostr-relay",
       "version": "0.0.1",
       "relay_countries": getEnv("RELAY_COUNTRIES", "JP").split(',').mapIt(it.strip()).filterIt(it.len > 0)
