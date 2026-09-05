@@ -18,6 +18,7 @@ from std/mimetypes import getExt, getMimeType, newMimetypes
 type
   RequestKind = enum
     kEVENT = "EVENT"
+    kAUTH = "AUTH"
     kREQ = "REQ"
     kCOUNT = "COUNT"
     kCLOSE = "CLOSE"
@@ -51,7 +52,7 @@ type
 
   MsgRequest = ref object
     case kind*: RequestKind
-    of kEVENT:
+    of kEVENT, kAUTH:
       event*: Event
     of kREQ, kCOUNT:
       subscriptionId*: string
@@ -76,6 +77,12 @@ type
     ws: WebSocket
     id: string
     filters: seq[Filter]
+    state: ConnectionState
+
+  ConnectionState = ref object
+    challenge: string
+    relayUrl: string
+    authenticatedPubkeys: Table[string, bool]
 
 
 var
@@ -154,6 +161,10 @@ proc parseRequest(jsonStr: string): MsgRequest =
       raise newException(ValueError, "EVENT message must include an event")
     let ev = node[1].to(Event)
     return MsgRequest(kind: kEVENT, event: ev)
+  of "AUTH":
+    if node.len < 2:
+      raise newException(ValueError, "AUTH message must include an event")
+    return MsgRequest(kind: kAUTH, event: node[1].to(Event))
   of "REQ":
     if node.len < 2:
       raise newException(ValueError, "REQ message must include a subscription id")
@@ -403,8 +414,14 @@ proc deleteEventByKindAndPubkeyAndDtag(kind: int, pubkey: string, dtag: string,
 proc deleteEventByIdAndKindAndPtag(id: string, kind: int, ptag: string): bool =
   try:
     withDbRetry:
-      db.exec(sql"DELETE FROM event WHERE id = ? AND kind = ? AND tags @> ?::jsonb",
-          id, kind, ["p", ptag].toJson())
+      db.exec(sql"""
+        DELETE FROM event
+        WHERE id = ? AND kind = ?
+          AND EXISTS (
+            SELECT 1 FROM jsonb_array_elements(tags) tag
+            WHERE tag->>0 = 'p' AND tag->>1 = ?
+          )
+      """, id, kind, ptag)
     return true
   except DbError:
     return false
@@ -437,7 +454,8 @@ proc getEventById(id: string): Option[Event] =
       ))
   return none(Event)
 
-proc buildQueryFromFilter(filter: Filter, countOnly = false): (string, seq[string]) =
+proc buildQueryFromFilter(filter: Filter, state: ConnectionState,
+    countOnly = false): (string, seq[string]) =
   var whereClauses: seq[string] = @[]
   var params: seq[string] = @[]
 
@@ -481,6 +499,15 @@ proc buildQueryFromFilter(filter: Filter, countOnly = false): (string, seq[strin
       params.add(ptag)
       whereClauses.add("? = ANY(tagvalues)")
 
+  if state.authenticatedPubkeys.len == 0:
+    whereClauses.add("kind <> 1059")
+  else:
+    var authConditions: seq[string]
+    for pubkey in state.authenticatedPubkeys.keys:
+      params.add(pubkey)
+      authConditions.add("tag->>1 = ?")
+    whereClauses.add("(kind <> 1059 OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'p' AND (" & authConditions.join(" OR ") & ")))")
+
   var query = if countOnly:
       "SELECT id, tags FROM event"
     else:
@@ -514,7 +541,7 @@ proc cleanupWs(ws: WebSocket) =
   for key in toDelete:
     subscriptions.del(key)
 
-proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
+proc doEVENT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async.} =
   if not isValidEvent(msg.event):
     await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
         resultValue: false, message: "invalid: event is invalid")))
@@ -532,7 +559,7 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
     return
 
   # NIP-70: Protected events - reject events with ["-"] tag
-  if isProtectedEvent(msg.event):
+  if isProtectedEvent(msg.event) and not state.authenticatedPubkeys.hasKey(msg.event.pubkey):
     await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
         resultValue: false, message: "auth-required: this event may only be published by its author")))
     return
@@ -589,6 +616,14 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
   # Broadcast to matching subscriptions
   var broadcastTargets: seq[tuple[ws: WebSocket, eventJson: string]]
   for sub in subscriptions.values:
+    if msg.event.kind == 1059:
+      var recipient = false
+      for tag in msg.event.tags:
+        if tag.len > 1 and tag[0] == "p" and sub.state.authenticatedPubkeys.hasKey(tag[1]):
+          recipient = true
+          break
+      if not recipient:
+        continue
     for filter in sub.filters:
       if filterMatch(msg.event, filter):
         let eventJson = toJson(%*["EVENT", sub.id, msg.event])
@@ -604,12 +639,12 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest) {.async.} =
       cleanupWs(target.ws)
 
 
-proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
+proc doREQ(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsafe.} =
   subscriptions[msg.subscriptionId] = Subscription(ws: ws, id: msg.subscriptionId,
-      filters: msg.filters)
+      filters: msg.filters, state: state)
   for filter in msg.filters:
     try:
-      let (query, params) = buildQueryFromFilter(filter)
+      let (query, params) = buildQueryFromFilter(filter, state)
       withDbRetry:
         for row in db.rows(sql(query), params):
           let tags = fromJson(row[4], seq[seq[string]])
@@ -644,11 +679,11 @@ proc doREQ(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
       eoseSubscriptionId: msg.subscriptionId)))
 
 
-proc doCOUNT(ws: WebSocket, msg: MsgRequest) {.async, gcsafe.} =
+proc doCOUNT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsafe.} =
   var eventIds = initTable[string, bool]()
   try:
     for filter in msg.filters:
-      let (query, params) = buildQueryFromFilter(filter, true)
+      let (query, params) = buildQueryFromFilter(filter, state, true)
       withDbRetry:
         for row in db.rows(sql(query), params):
           let tags = fromJson(row[1], seq[seq[string]])
@@ -676,6 +711,50 @@ proc doCLOSE(ws: WebSocket, msg: MsgRequest) =
      subscriptions[msg.closeSubscriptionId].ws == ws:
     subscriptions.del(msg.closeSubscriptionId)
 
+proc normalizeRelayUrl(value: string): string =
+  result = value.toLowerAscii()
+  while result.endsWith("/"):
+    result.setLen(result.len - 1)
+
+proc doAUTH(ws: WebSocket, msg: MsgRequest,
+    state: ConnectionState) {.async, gcsafe.} =
+  let event = msg.event
+  template reject(reason: string) =
+    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: event.id,
+        resultValue: false, message: "invalid: " & reason)))
+    return
+
+  if event.kind != 22242:
+    reject("authentication event must be kind 22242")
+  if abs(getTime().toUnix() - event.created_at) > 600:
+    reject("authentication event timestamp is out of range")
+  var challengeMatches = false
+  var relayMatches = false
+  for tag in event.tags:
+    if tag.len > 1 and tag[0] == "challenge" and tag[1] == state.challenge:
+      challengeMatches = true
+    if tag.len > 1 and tag[0] == "relay" and
+        normalizeRelayUrl(tag[1]) == normalizeRelayUrl(state.relayUrl):
+      relayMatches = true
+  if not challengeMatches:
+    reject("authentication challenge does not match")
+  if not relayMatches:
+    reject("authentication relay does not match")
+  if not verifyEvent(event):
+    reject("authentication signature verification failed")
+  state.authenticatedPubkeys[event.pubkey] = true
+  await ws.send(toResponseJson(MsgResponse(kind: kOK, id: event.id,
+      resultValue: true, message: "")))
+
+proc randomChallenge(): string =
+  var bytes: array[32, byte]
+  var file = open("/dev/urandom", fmRead)
+  defer: file.close()
+  if file.readBuffer(addr bytes[0], bytes.len) != bytes.len:
+    raise newException(IOError, "could not generate authentication challenge")
+  for value in bytes:
+    result.add(value.toHex(2).toLowerAscii())
+
 
 # Extract the real client IP from proxy headers (e.g. Cloudflare Tunnel /
 # reverse proxy). Falls back to the peer address, or "-" when unknown.
@@ -690,7 +769,8 @@ proc extractClientIp(req: Request): string =
   return "-"
 
 
-proc process(ws: WebSocket, clientIp: string) {.async, gcsafe.} =
+proc process(ws: WebSocket, clientIp: string,
+    state: ConnectionState) {.async, gcsafe.} =
   try:
     let packet = strip(await ws.receiveStrPacket())
     if packet.len == 0:
@@ -703,11 +783,13 @@ proc process(ws: WebSocket, clientIp: string) {.async, gcsafe.} =
 
     case msg.kind:
     of kEVENT:
-      await doEVENT(ws, msg)
+      await doEVENT(ws, msg, state)
+    of kAUTH:
+      await doAUTH(ws, msg, state)
     of kREQ:
-      await doREQ(ws, msg)
+      await doREQ(ws, msg, state)
     of kCOUNT:
-      await doCOUNT(ws, msg)
+      await doCOUNT(ws, msg, state)
     of kCLOSE:
       doCLOSE(ws, msg)
 
@@ -725,11 +807,16 @@ proc cb(req: Request) {.async, gcsafe.} =
     let clientIp = extractClientIp(req)
     try:
       ws = await newWebSocket(req)
+      let state = ConnectionState(
+        challenge: randomChallenge(),
+        relayUrl: getEnv("RELAY_URL", "wss://" & req.headers.getOrDefault("Host")),
+        authenticatedPubkeys: initTable[string, bool]())
       withLock loggerLock:
         {.cast(gcsafe).}:
           logger.log(lvlInfo, "[", clientIp, "] Client connected")
+      await ws.send(toJson(%*["AUTH", state.challenge]))
       while ws.readyState == Open:
-        await process(ws, clientIp)
+        await process(ws, clientIp, state)
     except WebSocketClosedError:
       discard
     except:
@@ -751,7 +838,7 @@ proc cb(req: Request) {.async, gcsafe.} =
       "pubkey": getEnv("RELAY_PUBKEY", ""),
       "contact": getEnv("RELAY_CONTACT", ""),
       "icon": getEnv("RELAY_ICON", ""),
-      "supported_nips": [1, 4, 9, 11, 40, 45, 66, 70, 78],
+      "supported_nips": [1, 4, 9, 11, 17, 40, 42, 45, 59, 66, 70, 78],
       "software": "https://github.com/mattn/nim-nostr-relay",
       "version": "0.0.1",
       "relay_countries": getEnv("RELAY_COUNTRIES", "JP").split(',').mapIt(it.strip()).filterIt(it.len > 0)
