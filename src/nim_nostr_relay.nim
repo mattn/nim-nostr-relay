@@ -201,12 +201,24 @@ proc toResponseJson(response: MsgResponse): string =
     return toJson(%*["CLOSED", response.reason])
 
 
+proc delegatedBy(event: Event, author: string): bool =
+  for tag in event.tags:
+    if tag.len == 4 and tag[0] == "delegation" and tag[1].startsWith(author):
+      return true
+  return false
+
+
 proc filterMatch(event: Event, filter: Filter): bool =
   var match = true
   if filter.ids.isSome:
     match = event.id in filter.ids.get()
   if filter.authors.isSome:
-    match = match and (event.pubkey in filter.authors.get())
+    var foundAuthor = false
+    for author in filter.authors.get():
+      if event.pubkey.startsWith(author) or event.delegatedBy(author):
+        foundAuthor = true
+        break
+    match = match and foundAuthor
   if filter.kinds.isSome:
     match = match and (event.kind in filter.kinds.get())
   if filter.since.isSome:
@@ -295,32 +307,36 @@ proc validateDelegationConditions(event: Event, conditions: string): bool =
   # NIP-26: conditions is an &-separated query string, e.g.
   # "kind=1&created_at>1674834236&created_at<1677426236"
   var kindAllowed = false
+  var kindPresent = false
   var createdAtValid = true
 
   for condition in conditions.split('&'):
     if condition.startsWith("kind="):
+      kindPresent = true
       try:
         let allowedKind = parseInt(condition[5 .. ^1])
         if event.kind == allowedKind:
           kindAllowed = true
       except ValueError:
-        discard
+        return false
     elif condition.startsWith("created_at<"):
       try:
         let maxTime = parseBiggestInt(condition[11 .. ^1])
         if event.created_at >= maxTime:
           createdAtValid = false
       except ValueError:
-        discard
+        return false
     elif condition.startsWith("created_at>"):
       try:
         let minTime = parseBiggestInt(condition[11 .. ^1])
         if event.created_at <= minTime:
           createdAtValid = false
       except ValueError:
-        discard
+        return false
+    else:
+      return false
 
-  return kindAllowed and createdAtValid
+  return (not kindPresent or kindAllowed) and createdAtValid
 
 proc verifyDelegationSignature(delegateePubkey: string, delegatorPubkey: string,
     conditions: string, signature: string): bool =
@@ -383,10 +399,18 @@ proc validateDelegation(event: Event): bool =
 
   return true
 
-proc deleteEventByIdAndPubkey(id: string, pubkey: string): bool =
+proc deleteEventByIdAndAuthor(id: string, pubkey: string): bool =
   try:
     withDbRetry:
-      db.exec(sql"DELETE FROM event WHERE id = ? AND pubkey = ?", id, pubkey)
+      db.exec(sql"""
+        DELETE FROM event
+        WHERE id = ? AND (
+          pubkey = ? OR EXISTS (
+            SELECT 1 FROM jsonb_array_elements(tags) tag
+            WHERE tag->>0 = 'delegation' AND tag->>1 = ?
+          )
+        )
+      """, id, pubkey, pubkey)
     return true
   except DbError:
     return false
@@ -473,7 +497,8 @@ proc buildQueryFromFilter(filter: Filter, state: ConnectionState,
     var authorConditions: seq[string] = @[]
     for author in authors:
       params.add(author)
-      authorConditions.add("pubkey LIKE ? || '%'")
+      params.add(author)
+      authorConditions.add("(pubkey LIKE ? || '%' OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'delegation' AND tag->>1 LIKE ? || '%'))")
     if authorConditions.len > 0:
       whereClauses.add("(" & authorConditions.join(" OR ") & ")")
 
@@ -578,7 +603,7 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async.} =
                   message: "error: failed to delete event")))
               return
           else:
-            if not deleteEventByIdAndPubkey(tag[1], msg.event.pubkey):
+            if not deleteEventByIdAndAuthor(tag[1], msg.event.pubkey):
               await ws.send(toResponseJson(MsgResponse(kind: kOK,
                   id: msg.event.id, resultValue: false,
                   message: "error: failed to delete event")))
@@ -838,7 +863,7 @@ proc cb(req: Request) {.async, gcsafe.} =
       "pubkey": getEnv("RELAY_PUBKEY", ""),
       "contact": getEnv("RELAY_CONTACT", ""),
       "icon": getEnv("RELAY_ICON", ""),
-      "supported_nips": [1, 4, 9, 11, 17, 40, 42, 45, 59, 66, 70, 78],
+      "supported_nips": [1, 4, 9, 11, 17, 26, 40, 42, 45, 59, 66, 70, 78],
       "software": "https://github.com/mattn/nim-nostr-relay",
       "version": "0.0.1",
       "relay_countries": getEnv("RELAY_COUNTRIES", "JP").split(',').mapIt(it.strip()).filterIt(it.len > 0)
