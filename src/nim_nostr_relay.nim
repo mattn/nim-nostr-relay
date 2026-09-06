@@ -49,6 +49,7 @@ type
     since*: Option[int64]
     until*: Option[int64]
     limit*: Option[int]
+    search*: Option[string]
 
   MsgRequest = ref object
     case kind*: RequestKind
@@ -208,6 +209,18 @@ proc delegatedBy(event: Event, author: string): bool =
   return false
 
 
+# NIP-50: split a search string into words. An event matches when every word
+# occurs in its content, which is also what buildQueryFromFilter asks the
+# database for, so stored and live results agree.
+proc searchWords(search: Option[string]): seq[string] =
+  if search.isNone:
+    return @[]
+  search.get().splitWhitespace()
+
+# Escape the LIKE wildcards so a search for '%' cannot match everything.
+proc escapeLike(word: string): string =
+  word.multiReplace(("\\", "\\\\"), ("%", "\\%"), ("_", "\\_"))
+
 proc filterMatch(event: Event, filter: Filter): bool =
   var match = true
   if filter.ids.isSome:
@@ -225,6 +238,11 @@ proc filterMatch(event: Event, filter: Filter): bool =
     match = match and (event.created_at >= filter.since.get())
   if filter.until.isSome:
     match = match and (event.created_at <= filter.until.get())
+  let searchTerms = filter.search.searchWords()
+  if searchTerms.len > 0:
+    let lowered = event.content.toLowerAscii()
+    for word in searchTerms:
+      match = match and lowered.contains(word.toLowerAscii())
   if filter.e.isSome:
     var foundE = false
     for tag in event.tags:
@@ -511,6 +529,11 @@ proc buildQueryFromFilter(filter: Filter, state: ConnectionState,
 
   if filter.until.isSome:
     whereClauses.add("created_at <= " & $filter.until.get())
+
+  # NIP-50: every word of the search string must occur in the content
+  for word in filter.search.searchWords():
+    params.add("%" & word.escapeLike() & "%")
+    whereClauses.add("content ILIKE ?")
 
   if filter.e.isSome:
     let etags = filter.e.get()
@@ -863,7 +886,7 @@ proc cb(req: Request) {.async, gcsafe.} =
       "pubkey": getEnv("RELAY_PUBKEY", ""),
       "contact": getEnv("RELAY_CONTACT", ""),
       "icon": getEnv("RELAY_ICON", ""),
-      "supported_nips": [1, 4, 9, 11, 17, 26, 40, 42, 45, 59, 66, 70, 78],
+      "supported_nips": [1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78],
       "software": "https://github.com/mattn/nim-nostr-relay",
       "version": "0.0.1",
       "relay_countries": getEnv("RELAY_COUNTRIES", "JP").split(',').mapIt(it.strip()).filterIt(it.len > 0)
