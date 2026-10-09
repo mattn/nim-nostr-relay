@@ -1,4 +1,4 @@
-import asyncdispatch, asynchttpserver, ws
+import asyncdispatch, asynchttpserver, asyncnet, ws
 import uri
 import strutils
 import json, jsony, options, sequtils, tables
@@ -826,10 +826,91 @@ proc extractClientIp(req: Request): string =
   return "-"
 
 
+const maxMessageSize = 512 * 1024
+
+proc receiveText(ws: WebSocket): Future[string] {.async.} =
+  ## ws.receiveStrPacket with a size limit. The library allocates whatever
+  ## length a frame header claims and joins fragments without bound, so a
+  ## single client could make the relay allocate gigabytes. Frames are read
+  ## the same way here, but a message that would exceed maxMessageSize closes
+  ## the connection with 1009 before its payload is read.
+  var started = false
+  while true:
+    let header = await ws.tcpSocket.recv(2)
+    if header.len != 2:
+      ws.readyState = Closed
+      raise newException(WebSocketClosedError, "Socket closed")
+    let b0 = header[0].uint8
+    let b1 = header[1].uint8
+    if (b0 and 0x70) != 0:
+      ws.readyState = Closed
+      raise newException(WebSocketError, "WebSocket rsv mismatch")
+    let fin = (b0 and 0x80) != 0
+    let opcode = (b0 and 0x0f).Opcode
+    if (b1 and 0x80) == 0:
+      raise newException(WebSocketError, "Socket mask mismatch")
+
+    var length = uint64(b1 and 0x7f)
+    if length == 0x7e:
+      let ext = await ws.tcpSocket.recv(2)
+      if ext.len != 2:
+        raise newException(WebSocketClosedError, "Socket closed")
+      length = (uint64(ext[0].uint8) shl 8) or uint64(ext[1].uint8)
+    elif length == 0x7f:
+      let ext = await ws.tcpSocket.recv(8)
+      if ext.len != 8:
+        raise newException(WebSocketClosedError, "Socket closed")
+      length = 0
+      for c in ext:
+        length = (length shl 8) or uint64(c.uint8)
+
+    if length > uint64(maxMessageSize - result.len):
+      try:
+        await ws.send("\x03\xf1message too large", Close)
+      except:
+        discard
+      ws.readyState = Closed
+      ws.tcpSocket.close()
+      raise newException(WebSocketClosedError, "message too large")
+
+    let maskKey = await ws.tcpSocket.recv(4)
+    if maskKey.len != 4:
+      raise newException(WebSocketClosedError, "Socket closed")
+    var data = ""
+    if length > 0:
+      data = await ws.tcpSocket.recv(int(length))
+      if data.len != int(length):
+        raise newException(WebSocketClosedError, "Socket closed")
+      for i in 0 ..< data.len:
+        data[i] = (data[i].uint8 xor maskKey[i mod 4].uint8).char
+
+    case opcode
+    of Ping:
+      await ws.send(data, Pong)
+      continue
+    of Pong:
+      continue
+    of Close:
+      ws.readyState = Closed
+      raise newException(WebSocketClosedError, "Socket closed")
+    of Binary:
+      raise newException(WebSocketError, "Expected string packet, received binary packet")
+    of Text:
+      if started:
+        raise newException(WebSocketError, "Unexpected text frame inside a fragmented message")
+      started = true
+      result = data
+    of Cont:
+      if not started:
+        raise newException(WebSocketError, "Unexpected continuation frame")
+      result.add data
+    if fin:
+      return
+
 proc process(ws: WebSocket, clientIp: string,
     state: ConnectionState) {.async, gcsafe.} =
   try:
-    let packet = strip(await ws.receiveStrPacket())
+    let packet = strip(await ws.receiveText())
     if packet.len == 0:
       return
 
@@ -898,7 +979,8 @@ proc cb(req: Request) {.async, gcsafe.} =
       "supported_nips": [1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78],
       "software": "https://github.com/mattn/nim-nostr-relay",
       "version": "0.0.1",
-      "relay_countries": getEnv("RELAY_COUNTRIES", "JP").split(',').mapIt(it.strip()).filterIt(it.len > 0)
+      "relay_countries": getEnv("RELAY_COUNTRIES", "JP").split(',').mapIt(it.strip()).filterIt(it.len > 0),
+      "limitation": {"max_message_length": maxMessageSize}
     }
     await req.respond(Http200, toJson(relayInfo), newHttpHeaders({
         "Content-Type": "application/nostr+json", "Access-Control-Allow-Origin": "*"}))
