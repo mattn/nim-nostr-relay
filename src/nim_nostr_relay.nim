@@ -502,6 +502,8 @@ proc getEventById(id: string): Option[Event] =
       ))
   return none(Event)
 
+const maxQueryLimit = 500
+
 proc buildQueryFromFilter(filter: Filter, state: ConnectionState,
     countOnly = false): (string, seq[string]) =
   var whereClauses: seq[string] = @[]
@@ -572,10 +574,11 @@ proc buildQueryFromFilter(filter: Filter, state: ConnectionState,
   if not countOnly:
     query &= " ORDER BY created_at DESC"
 
-    if filter.limit.isSome:
-      query &= " LIMIT " & $filter.limit.get()
-    else:
-      query &= " LIMIT 500"
+    # The client's limit is capped: memory grows with the largest result
+    # streamed back, and the allocator keeps that high-water mark.
+    let limit = if filter.limit.isSome: clamp(filter.limit.get(), 0, maxQueryLimit)
+                else: maxQueryLimit
+    query &= " LIMIT " & $limit
 
   return (query, params)
 
