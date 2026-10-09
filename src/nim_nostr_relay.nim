@@ -588,6 +588,12 @@ proc isProtectedEvent(event: Event): bool =
       return true
   return false
 
+# Subscription IDs are only unique within a connection ("sub" is common), so
+# the table is keyed by connection and ID; otherwise one client's REQ would
+# replace another client's subscription of the same name.
+proc subKey(ws: WebSocket, id: string): string =
+  $cast[uint](ws) & ":" & id
+
 proc cleanupWs(ws: WebSocket) =
   if ws.isNil:
     return
@@ -697,7 +703,7 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async.} =
 
 
 proc doREQ(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsafe.} =
-  subscriptions[msg.subscriptionId] = Subscription(ws: ws, id: msg.subscriptionId,
+  subscriptions[subKey(ws, msg.subscriptionId)] = Subscription(ws: ws, id: msg.subscriptionId,
       filters: msg.filters, state: state)
   for filter in msg.filters:
     try:
@@ -764,9 +770,7 @@ proc doCOUNT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gc
 
 
 proc doCLOSE(ws: WebSocket, msg: MsgRequest) =
-  if subscriptions.hasKey(msg.closeSubscriptionId) and
-     subscriptions[msg.closeSubscriptionId].ws == ws:
-    subscriptions.del(msg.closeSubscriptionId)
+  subscriptions.del(subKey(ws, msg.closeSubscriptionId))
 
 proc normalizeRelayUrl(value: string): string =
   result = value.toLowerAscii()
