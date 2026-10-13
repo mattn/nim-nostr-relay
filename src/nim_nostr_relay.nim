@@ -943,6 +943,19 @@ proc process(ws: WebSocket, clientIp: string,
         notice: getCurrentExceptionMsg())))
 
 
+proc pinger(ws: WebSocket) {.async, gcsafe.} =
+  ## Cloudflare Tunnel drops websockets that are idle for 100 seconds, so
+  ## ping each client periodically to keep the connection alive.
+  while ws.readyState == Open:
+    await sleepAsync(30_000)
+    if ws.readyState != Open:
+      break
+    try:
+      await ws.send("", Ping)
+    except:
+      break
+
+
 proc cb(req: Request) {.async, gcsafe.} =
   if req.url.path == "/" and req.headers.getOrDefault("Upgrade") == "websocket":
     var ws: WebSocket = nil
@@ -957,6 +970,7 @@ proc cb(req: Request) {.async, gcsafe.} =
         {.cast(gcsafe).}:
           logger.log(lvlInfo, "[", clientIp, "] Client connected")
       await ws.send(toJson(%*["AUTH", state.challenge]))
+      asyncCheck pinger(ws)
       while ws.readyState == Open:
         await process(ws, clientIp, state)
     except WebSocketClosedError:
