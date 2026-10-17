@@ -152,6 +152,17 @@ CREATE TABLE IF NOT EXISTS event (
   "CREATE INDEX IF NOT EXISTS contenttrgmidx ON event USING gin (content gin_trgm_ops)"
 ]
 
+proc parseFilter(node: JsonNode): Filter =
+  result = node.to(Filter)
+  # NIP-01: an empty "#x" list can never be satisfied. Record it as a tag
+  # condition without a value, which matches no event.
+  if node.kind == JObject:
+    for key, value in node.pairs:
+      if key.len > 1 and key[0] == '#' and value.kind == JArray and value.len == 0:
+        var tags = result.tags.get(@[])
+        tags.add(@[key[1 .. ^1]])
+        result.tags = some(tags)
+
 proc parseRequest(jsonStr: string): MsgRequest =
   let node = jsonStr.parseJson()
   if node.kind != JArray:
@@ -178,7 +189,7 @@ proc parseRequest(jsonStr: string): MsgRequest =
     let subId = node[1].getStr()
     var filters: seq[Filter]
     for i in 2 ..< node.len:
-      filters.add node[i].to(Filter)
+      filters.add node[i].parseFilter()
     return MsgRequest(kind: kREQ, subscriptionId: subId, filters: filters)
   of "COUNT":
     if node.len < 3:
@@ -186,7 +197,7 @@ proc parseRequest(jsonStr: string): MsgRequest =
     let queryId = node[1].getStr()
     var filters: seq[Filter]
     for i in 2 ..< node.len:
-      filters.add node[i].to(Filter)
+      filters.add node[i].parseFilter()
     return MsgRequest(kind: kCOUNT, subscriptionId: queryId, filters: filters)
   of "CLOSE":
     if node.len < 2:
@@ -227,7 +238,20 @@ proc searchWords(search: Option[string]): seq[string] =
 proc escapeLike(word: string): string =
   word.multiReplace(("\\", "\\\\"), ("%", "\\%"), ("_", "\\_"))
 
+proc unsatisfiable(filter: Filter): bool =
+  ## NIP-01: an empty list matches nothing, rather than being treated as if
+  ## the attribute were absent.
+  (filter.ids.isSome and filter.ids.get().len == 0) or
+    (filter.authors.isSome and filter.authors.get().len == 0) or
+    (filter.kinds.isSome and filter.kinds.get().len == 0) or
+    (filter.e.isSome and filter.e.get().len == 0) or
+    (filter.p.isSome and filter.p.get().len == 0) or
+    (filter.t.isSome and filter.t.get().len == 0) or
+    (filter.tags.isSome and filter.tags.get().anyIt(it.len < 2))
+
 proc filterMatch(event: Event, filter: Filter): bool =
+  if filter.unsatisfiable:
+    return false
   var match = true
   if filter.ids.isSome:
     match = event.id in filter.ids.get()
@@ -706,6 +730,8 @@ proc doREQ(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsa
   subscriptions[subKey(ws, msg.subscriptionId)] = Subscription(ws: ws, id: msg.subscriptionId,
       filters: msg.filters, state: state)
   for filter in msg.filters:
+    if filter.unsatisfiable:
+      continue
     try:
       let (query, params) = buildQueryFromFilter(filter, state)
       withDbRetry:
@@ -746,6 +772,8 @@ proc doCOUNT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gc
   var eventIds = initTable[string, bool]()
   try:
     for filter in msg.filters:
+      if filter.unsatisfiable:
+        continue
       let (query, params) = buildQueryFromFilter(filter, state, true)
       withDbRetry:
         for row in db.rows(sql(query), params):
