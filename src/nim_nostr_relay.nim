@@ -1,7 +1,7 @@
 import asyncdispatch, asynchttpserver, asyncnet, ws
 import uri
 import strutils
-import json, jsony, options, sequtils, tables
+import algorithm, json, jsony, options, sequtils, tables
 import secp256k1
 import nimcrypto/[sha2, hash]
 import db_connector/db_postgres
@@ -38,6 +38,10 @@ type
     content*: string
     sig*: string
 
+  TagFilter = object
+    name*: string
+    values*: seq[string]
+
   Filter = object
     ids*: Option[seq[string]]
     authors*: Option[seq[string]]
@@ -50,6 +54,7 @@ type
     until*: Option[int64]
     limit*: Option[int]
     search*: Option[string]
+    tagFilters*: Option[seq[TagFilter]]
 
   MsgRequest = ref object
     case kind*: RequestKind
@@ -154,14 +159,23 @@ CREATE TABLE IF NOT EXISTS event (
 
 proc parseFilter(node: JsonNode): Filter =
   result = node.to(Filter)
-  # NIP-01: an empty "#x" list can never be satisfied. Record it as a tag
-  # condition without a value, which matches no event.
+  # NIP-01 tag filters ("#e", "#p", "#t", ...): an event must carry a tag of
+  # that name whose value is one of the listed values. The bare "e"/"p"/"t"
+  # keys predate them and are kept as aliases.
+  var tagFilters: seq[TagFilter]
   if node.kind == JObject:
     for key, value in node.pairs:
-      if key.len > 1 and key[0] == '#' and value.kind == JArray and value.len == 0:
-        var tags = result.tags.get(@[])
-        tags.add(@[key[1 .. ^1]])
-        result.tags = some(tags)
+      if key.len > 1 and key[0] == '#' and value.kind == JArray:
+        var values: seq[string]
+        for v in value:
+          if v.kind == JString:
+            values.add(v.getStr())
+        tagFilters.add(TagFilter(name: key[1 .. ^1], values: values))
+  for (name, values) in [("e", result.e), ("p", result.p), ("t", result.t)]:
+    if values.isSome:
+      tagFilters.add(TagFilter(name: name, values: values.get()))
+  if tagFilters.len > 0:
+    result.tagFilters = some(tagFilters)
 
 proc parseRequest(jsonStr: string): MsgRequest =
   let node = jsonStr.parseJson()
@@ -221,7 +235,7 @@ proc toResponseJson(response: MsgResponse): string =
 
 proc delegatedBy(event: Event, author: string): bool =
   for tag in event.tags:
-    if tag.len == 4 and tag[0] == "delegation" and tag[1].startsWith(author):
+    if tag.len == 4 and tag[0] == "delegation" and tag[1] == author:
       return true
   return false
 
@@ -244,9 +258,7 @@ proc unsatisfiable(filter: Filter): bool =
   (filter.ids.isSome and filter.ids.get().len == 0) or
     (filter.authors.isSome and filter.authors.get().len == 0) or
     (filter.kinds.isSome and filter.kinds.get().len == 0) or
-    (filter.e.isSome and filter.e.get().len == 0) or
-    (filter.p.isSome and filter.p.get().len == 0) or
-    (filter.t.isSome and filter.t.get().len == 0) or
+    (filter.tagFilters.isSome and filter.tagFilters.get().anyIt(it.values.len == 0)) or
     (filter.tags.isSome and filter.tags.get().anyIt(it.len < 2))
 
 proc filterMatch(event: Event, filter: Filter): bool =
@@ -258,7 +270,7 @@ proc filterMatch(event: Event, filter: Filter): bool =
   if filter.authors.isSome:
     var foundAuthor = false
     for author in filter.authors.get():
-      if event.pubkey.startsWith(author) or event.delegatedBy(author):
+      if event.pubkey == author or event.delegatedBy(author):
         foundAuthor = true
         break
     match = match and foundAuthor
@@ -273,27 +285,14 @@ proc filterMatch(event: Event, filter: Filter): bool =
     let lowered = event.content.toLowerAscii()
     for word in searchTerms:
       match = match and lowered.contains(word.toLowerAscii())
-  if filter.e.isSome:
-    var foundE = false
-    for tag in event.tags:
-      if tag.len > 1 and tag[0] == "e" and tag[1] in filter.e.get():
-        foundE = true
-        break
-    match = match and foundE
-  if filter.p.isSome:
-    var foundP = false
-    for tag in event.tags:
-      if tag.len > 1 and tag[0] == "p" and tag[1] in filter.p.get():
-        foundP = true
-        break
-    match = match and foundP
-  if filter.t.isSome:
-    var foundT = false
-    for tag in event.tags:
-      if tag.len > 1 and tag[0] == "t" and tag[1] in filter.t.get():
-        foundT = true
-        break
-    match = match and foundT
+  if filter.tagFilters.isSome:
+    for tagFilter in filter.tagFilters.get():
+      var foundTag = false
+      for tag in event.tags:
+        if tag.len > 1 and tag[0] == tagFilter.name and tag[1] in tagFilter.values:
+          foundTag = true
+          break
+      match = match and foundTag
 
   if filter.tags.isSome:
     for reqTag in filter.tags.get():
@@ -533,24 +532,19 @@ proc buildQueryFromFilter(filter: Filter, state: ConnectionState,
   var whereClauses: seq[string] = @[]
   var params: seq[string] = @[]
 
+  # NIP-01: ids and authors are exact 64-character hex values, not prefixes.
+  # Empty lists never get here: unsatisfiable filters are skipped.
   if filter.ids.isSome:
     let ids = filter.ids.get()
-    var idConditions: seq[string] = @[]
-    for id in ids:
-      params.add(id)
-      idConditions.add("id LIKE ? || '%'")
-    if idConditions.len > 0:
-      whereClauses.add("(" & idConditions.join(" OR ") & ")")
+    params.add(ids)
+    whereClauses.add("id IN (" & ids.mapIt("?").join(",") & ")")
 
   if filter.authors.isSome:
     let authors = filter.authors.get()
-    var authorConditions: seq[string] = @[]
-    for author in authors:
-      params.add(author)
-      params.add(author)
-      authorConditions.add("(pubkey LIKE ? || '%' OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'delegation' AND tag->>1 LIKE ? || '%'))")
-    if authorConditions.len > 0:
-      whereClauses.add("(" & authorConditions.join(" OR ") & ")")
+    let placeholders = authors.mapIt("?").join(",")
+    params.add(authors)
+    params.add(authors)
+    whereClauses.add("(pubkey IN (" & placeholders & ") OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'delegation' AND tag->>1 IN (" & placeholders & ")))")
 
   if filter.kinds.isSome:
     let kinds = filter.kinds.get()
@@ -567,17 +561,27 @@ proc buildQueryFromFilter(filter: Filter, state: ConnectionState,
     params.add("%" & word.escapeLike() & "%")
     whereClauses.add("content ILIKE ?")
 
-  if filter.e.isSome:
-    let etags = filter.e.get()
-    for etag in etags:
-      params.add(etag)
-      whereClauses.add("? = ANY(tagvalues)")
+  if filter.tagFilters.isSome:
+    for tagFilter in filter.tagFilters.get():
+      let placeholders = tagFilter.values.mapIt("?").join(",")
+      var clause = ""
+      # tagvalues holds the values of single-letter tags only; use it so the
+      # GIN index can narrow the rows before the exact check below.
+      if tagFilter.name.len == 1:
+        params.add(tagFilter.values)
+        clause = "tagvalues && ARRAY[" & placeholders & "]::text[] AND "
+      params.add(tagFilter.name)
+      params.add(tagFilter.values)
+      clause &= "EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = ? AND tag->>1 IN (" & placeholders & "))"
+      whereClauses.add("(" & clause & ")")
 
-  if filter.p.isSome:
-    let ptags = filter.p.get()
-    for ptag in ptags:
-      params.add(ptag)
-      whereClauses.add("? = ANY(tagvalues)")
+  # The nonstandard "tags" field: every [name, value] pair must be present,
+  # as in filterMatch.
+  if filter.tags.isSome:
+    for reqTag in filter.tags.get():
+      params.add(reqTag[0])
+      params.add(reqTag[1])
+      whereClauses.add("EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = ? AND tag->>1 = ?)")
 
   if state.authenticatedPubkeys.len == 0:
     whereClauses.add("kind <> 1059")
@@ -729,6 +733,10 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async.} =
 proc doREQ(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsafe.} =
   subscriptions[subKey(ws, msg.subscriptionId)] = Subscription(ws: ws, id: msg.subscriptionId,
       filters: msg.filters, state: state)
+  # NIP-01: filters are OR'd, so an event matching several of them is sent
+  # once. Each filter keeps its own limit; the union is sent newest first.
+  var events: seq[Event]
+  var seen = initTable[string, bool]()
   for filter in msg.filters:
     if filter.unsatisfiable:
       continue
@@ -744,9 +752,10 @@ proc doREQ(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsa
                 getTime().toUnix():
               expired = true
               break
-          if expired:
+          if expired or seen.hasKey(row[0]):
             continue
-          let event = Event(
+          seen[row[0]] = true
+          events.add Event(
             id: row[0],
             pubkey: row[1],
             created_at: parseInt(row[2]),
@@ -755,14 +764,15 @@ proc doREQ(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsa
             content: row[5],
             sig: row[6]
           )
-
-          let eventJson = toJson(%*["EVENT", msg.subscriptionId, event])
-          await ws.send(eventJson)
     except:
       withLock loggerLock:
         {.cast(gcsafe).}:
           logger.log(lvlError, "Failed to query events from database: ",
               getCurrentExceptionMsg())
+
+  events.sort(proc(a, b: Event): int = cmp(b.created_at, a.created_at))
+  for event in events:
+    await ws.send(toJson(%*["EVENT", msg.subscriptionId, event]))
 
   await ws.send(toResponseJson(MsgResponse(kind: kEOSE,
       eoseSubscriptionId: msg.subscriptionId)))
