@@ -1,7 +1,7 @@
 import asyncdispatch, asynchttpserver, asyncnet, ws
 import uri
 import strutils
-import json, jsony, options, sequtils, tables
+import algorithm, json, jsony, options, sequtils, tables
 import secp256k1
 import nimcrypto/[sha2, hash]
 import db_connector/db_postgres
@@ -235,7 +235,7 @@ proc toResponseJson(response: MsgResponse): string =
 
 proc delegatedBy(event: Event, author: string): bool =
   for tag in event.tags:
-    if tag.len == 4 and tag[0] == "delegation" and tag[1].startsWith(author):
+    if tag.len == 4 and tag[0] == "delegation" and tag[1] == author:
       return true
   return false
 
@@ -270,7 +270,7 @@ proc filterMatch(event: Event, filter: Filter): bool =
   if filter.authors.isSome:
     var foundAuthor = false
     for author in filter.authors.get():
-      if event.pubkey.startsWith(author) or event.delegatedBy(author):
+      if event.pubkey == author or event.delegatedBy(author):
         foundAuthor = true
         break
     match = match and foundAuthor
@@ -532,24 +532,19 @@ proc buildQueryFromFilter(filter: Filter, state: ConnectionState,
   var whereClauses: seq[string] = @[]
   var params: seq[string] = @[]
 
+  # NIP-01: ids and authors are exact 64-character hex values, not prefixes.
+  # Empty lists never get here: unsatisfiable filters are skipped.
   if filter.ids.isSome:
     let ids = filter.ids.get()
-    var idConditions: seq[string] = @[]
-    for id in ids:
-      params.add(id)
-      idConditions.add("id LIKE ? || '%'")
-    if idConditions.len > 0:
-      whereClauses.add("(" & idConditions.join(" OR ") & ")")
+    params.add(ids)
+    whereClauses.add("id IN (" & ids.mapIt("?").join(",") & ")")
 
   if filter.authors.isSome:
     let authors = filter.authors.get()
-    var authorConditions: seq[string] = @[]
-    for author in authors:
-      params.add(author)
-      params.add(author)
-      authorConditions.add("(pubkey LIKE ? || '%' OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'delegation' AND tag->>1 LIKE ? || '%'))")
-    if authorConditions.len > 0:
-      whereClauses.add("(" & authorConditions.join(" OR ") & ")")
+    let placeholders = authors.mapIt("?").join(",")
+    params.add(authors)
+    params.add(authors)
+    whereClauses.add("(pubkey IN (" & placeholders & ") OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'delegation' AND tag->>1 IN (" & placeholders & ")))")
 
   if filter.kinds.isSome:
     let kinds = filter.kinds.get()
@@ -579,6 +574,14 @@ proc buildQueryFromFilter(filter: Filter, state: ConnectionState,
       params.add(tagFilter.values)
       clause &= "EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = ? AND tag->>1 IN (" & placeholders & "))"
       whereClauses.add("(" & clause & ")")
+
+  # The nonstandard "tags" field: every [name, value] pair must be present,
+  # as in filterMatch.
+  if filter.tags.isSome:
+    for reqTag in filter.tags.get():
+      params.add(reqTag[0])
+      params.add(reqTag[1])
+      whereClauses.add("EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = ? AND tag->>1 = ?)")
 
   if state.authenticatedPubkeys.len == 0:
     whereClauses.add("kind <> 1059")
@@ -730,6 +733,10 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async.} =
 proc doREQ(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsafe.} =
   subscriptions[subKey(ws, msg.subscriptionId)] = Subscription(ws: ws, id: msg.subscriptionId,
       filters: msg.filters, state: state)
+  # NIP-01: filters are OR'd, so an event matching several of them is sent
+  # once. Each filter keeps its own limit; the union is sent newest first.
+  var events: seq[Event]
+  var seen = initTable[string, bool]()
   for filter in msg.filters:
     if filter.unsatisfiable:
       continue
@@ -745,9 +752,10 @@ proc doREQ(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsa
                 getTime().toUnix():
               expired = true
               break
-          if expired:
+          if expired or seen.hasKey(row[0]):
             continue
-          let event = Event(
+          seen[row[0]] = true
+          events.add Event(
             id: row[0],
             pubkey: row[1],
             created_at: parseInt(row[2]),
@@ -756,14 +764,15 @@ proc doREQ(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsa
             content: row[5],
             sig: row[6]
           )
-
-          let eventJson = toJson(%*["EVENT", msg.subscriptionId, event])
-          await ws.send(eventJson)
     except:
       withLock loggerLock:
         {.cast(gcsafe).}:
           logger.log(lvlError, "Failed to query events from database: ",
               getCurrentExceptionMsg())
+
+  events.sort(proc(a, b: Event): int = cmp(b.created_at, a.created_at))
+  for event in events:
+    await ws.send(toJson(%*["EVENT", msg.subscriptionId, event]))
 
   await ws.send(toResponseJson(MsgResponse(kind: kEOSE,
       eoseSubscriptionId: msg.subscriptionId)))
