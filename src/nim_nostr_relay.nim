@@ -346,6 +346,28 @@ proc verifyEvent(event: Event): bool =
   except:
     return false
 
+# NIP-13: minimum proof of work demanded of incoming events; 0 disables it
+let minPowDifficulty = (try: parseInt(getEnv("MIN_POW_DIFFICULTY", "0").strip()) except ValueError: 0)
+
+proc powDifficulty(id: string): int =
+  ## NIP-13: number of leading zero bits of the hex event id.
+  for c in id:
+    let n =
+      case c
+      of '0'..'9': ord(c) - ord('0')
+      of 'a'..'f': ord(c) - ord('a') + 10
+      of 'A'..'F': ord(c) - ord('A') + 10
+      else: -1
+    if n < 0:
+      break
+    if n == 0:
+      result += 4
+      continue
+    if n <= 1: result += 3
+    elif n <= 3: result += 2
+    elif n <= 7: result += 1
+    break
+
 proc isValidEvent(event: Event): bool =
   # Placeholder for actual event validation logic
   return event.id.len > 0 and event.pubkey.len > 0 and event.sig.len > 0
@@ -648,6 +670,15 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async.} =
     await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
         resultValue: false, message: "invalid: delegation verification failed")))
     return
+
+  # NIP-13: Proof of work - only the id is checked, not the nonce commitment
+  if minPowDifficulty > 0:
+    let difficulty = powDifficulty(msg.event.id)
+    if difficulty < minPowDifficulty:
+      await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+          resultValue: false, message: "pow: difficulty " & $difficulty &
+          " is less than " & $minPowDifficulty)))
+      return
 
   # NIP-70: Protected events - reject events with ["-"] tag
   if isProtectedEvent(msg.event) and not state.authenticatedPubkeys.hasKey(msg.event.pubkey):
@@ -1032,11 +1063,12 @@ proc cb(req: Request) {.async, gcsafe.} =
       "pubkey": getEnv("RELAY_PUBKEY", ""),
       "contact": getEnv("RELAY_CONTACT", ""),
       "icon": getEnv("RELAY_ICON", ""),
-      "supported_nips": [1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78],
+      "supported_nips": [1, 4, 9, 11, 13, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78],
       "software": "https://github.com/mattn/nim-nostr-relay",
       "version": "0.0.1",
       "relay_countries": getEnv("RELAY_COUNTRIES", "JP").split(',').mapIt(it.strip()).filterIt(it.len > 0),
-      "limitation": {"max_message_length": maxMessageSize}
+      "limitation": {"max_message_length": maxMessageSize,
+          "min_pow_difficulty": minPowDifficulty}
     }
     await req.respond(Http200, toJson(relayInfo), newHttpHeaders({
         "Content-Type": "application/nostr+json", "Access-Control-Allow-Origin": "*"}))
