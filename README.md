@@ -8,6 +8,7 @@ This relay supports the following Nostr Implementation Possibilities (NIPs):
 
 - **NIP-01**: Basic protocol flow
 - **NIP-11**: Relay Information Document
+- **NIP-13**: Proof of Work (minimum difficulty via `MIN_POW_DIFFICULTY`)
 - **NIP-20**: Command results (OK messages)
 - **NIP-26**: Delegated event signing
 
@@ -64,6 +65,7 @@ Set the following environment variables:
 
 - `DATABASE_URL`: PostgreSQL connection string (e.g., `postgres://user:pass@host:5432/nostr`)
 - Or use individual variables: `DB_HOST`, `DB_USER`, `DB_PASS`, `DB_NAME`
+- `MIN_POW_DIFFICULTY`: minimum NIP-13 proof of work (leading zero bits of the event id) required for incoming events (default `0`, disabled)
 
 ## License
 
