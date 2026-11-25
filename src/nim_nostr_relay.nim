@@ -632,6 +632,17 @@ proc buildQueryFromFilter(filter: Filter, state: ConnectionState,
 
   return (query, params)
 
+# NIP-40: whether the tags carry an expiration timestamp that has passed.
+# Malformed values are ignored.
+proc isExpired(tags: seq[seq[string]]): bool =
+  for tag in tags:
+    if tag.len > 1 and tag[0] == "expiration":
+      try:
+        return parseBiggestInt(tag[1]) <= getTime().toUnix()
+      except ValueError:
+        return false
+  return false
+
 proc isProtectedEvent(event: Event): bool =
   for tag in event.tags:
     if tag.len == 1 and tag[0] == "-":
@@ -684,6 +695,12 @@ proc doEVENT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async.} =
   if isProtectedEvent(msg.event) and not state.authenticatedPubkeys.hasKey(msg.event.pubkey):
     await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
         resultValue: false, message: "auth-required: this event may only be published by its author")))
+    return
+
+  # NIP-40: an event that has already expired is not accepted
+  if isExpired(msg.event.tags):
+    await ws.send(toResponseJson(MsgResponse(kind: kOK, id: msg.event.id,
+        resultValue: false, message: "invalid: event has expired")))
     return
 
   if msg.event.kind == 5:
@@ -777,13 +794,7 @@ proc doREQ(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gcsa
         for row in db.rows(sql(query), params):
           let tags = fromJson(row[4], seq[seq[string]])
 
-          var expired = false
-          for tag in tags:
-            if tag.len > 1 and tag[0] == "expiration" and parseInt(tag[1]) <=
-                getTime().toUnix():
-              expired = true
-              break
-          if expired or seen.hasKey(row[0]):
+          if isExpired(tags) or seen.hasKey(row[0]):
             continue
           seen[row[0]] = true
           events.add Event(
@@ -819,13 +830,7 @@ proc doCOUNT(ws: WebSocket, msg: MsgRequest, state: ConnectionState) {.async, gc
       withDbRetry:
         for row in db.rows(sql(query), params):
           let tags = fromJson(row[1], seq[seq[string]])
-          var expired = false
-          for tag in tags:
-            if tag.len > 1 and tag[0] == "expiration" and parseInt(tag[1]) <=
-                getTime().toUnix():
-              expired = true
-              break
-          if not expired:
+          if not isExpired(tags):
             eventIds[row[0]] = true
     await ws.send(toJson(%*["COUNT", msg.subscriptionId,
         {"count": eventIds.len}]))
